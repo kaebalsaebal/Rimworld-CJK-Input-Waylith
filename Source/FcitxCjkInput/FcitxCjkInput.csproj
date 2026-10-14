@@ -16,9 +16,10 @@
     <Deterministic>true</Deterministic>
     <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <SteamApps Condition="'$(SteamApps)' == '' and '$(OS)' == 'Windows_NT'">$([System.Environment]::GetEnvironmentVariable('ProgramFiles(x86)'))/Steam/steamapps</SteamApps>
     <SteamApps Condition="'$(SteamApps)' == ''">/home/deck/.local/share/Steam/steamapps</SteamApps>
-    <RimWorldDir>$(SteamApps)/common/RimWorld</RimWorldDir>
-    <HarmonyDir>$(SteamApps)/workshop/content/294100/2009463077/1.7/Assemblies</HarmonyDir>
+    <RimWorldDir Condition="'$(RimWorldDir)' == ''">$(SteamApps)/common/RimWorld</RimWorldDir>
+    <HarmonyDir Condition="'$(HarmonyDir)' == ''">$(SteamApps)/workshop/content/294100/2009463077/1.7/Assemblies</HarmonyDir>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <PlatformTarget>AnyCPU</PlatformTarget>
@@ -49,6 +50,14 @@
     </Reference>
     <Reference Include="UnityStubs">
       <HintPath>$(RimWorldDir)/UnityStubs.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Waylith">
+      <HintPath>$(RimWorldDir)/Waylith.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Waylith.UnityCompat">
+      <HintPath>$(RimWorldDir)/Waylith.UnityCompat.dll</HintPath>
       <Private>False</Private>
     </Reference>
   </ItemGroup>
