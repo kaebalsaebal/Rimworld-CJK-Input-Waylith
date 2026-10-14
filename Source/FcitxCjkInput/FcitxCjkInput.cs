@@ -142,7 +142,11 @@ namespace FcitxCjkInput {
         private static void Patch() {
             var harmony = new Harmony("scarf.cjkinput");
             var rootOnGui = AccessTools.Method(typeof(Root), "OnGUI");
-            var desktopTextField = AccessTools.Method(typeof(GUI), "HandleTextFieldEventForDesktop");
+            //var desktopTextField = AccessTools.Method(typeof(GUI), "HandleTextFieldEventForDesktop");
+            var desktopTextField = AccessTools.Method(typeof(GUI), "DoTextField", new[] {
+                typeof(Rect), typeof(int), typeof(GUIContent), typeof(bool), typeof(int),
+                typeof(GUIStyle)
+            });
             var drawTextAreaContent = AccessTools.Method(typeof(GUI), "DrawTextAreaContent");
             var quickSearch = AccessTools.Method(typeof(QuickSearchWidget), nameof(QuickSearchWidget.OnGUI));
             var searchTextSetter = AccessTools.PropertySetter(typeof(QuickSearchFilter),
@@ -155,8 +159,10 @@ namespace FcitxCjkInput {
                 nameof(PlaySettings.DoPlaySettingsGlobalControls));
             if (rootOnGui == null)
                 throw new MissingMethodException("Verse.Root.OnGUI");
+            //if (desktopTextField == null)
+            //    throw new MissingMethodException("UnityEngine.GUI.HandleTextFieldEventForDesktop");
             if (desktopTextField == null)
-                throw new MissingMethodException("UnityEngine.GUI.HandleTextFieldEventForDesktop");
+                throw new MissingMethodException("UnityEngine.GUI.DoTextField(Rect, Int32, GUIContent, Boolean, Int32, GUIStyle)");
             if (drawTextAreaContent == null)
                 throw new MissingMethodException("UnityEngine.GUI.DrawTextAreaContent");
             if (quickSearch == null)
@@ -468,7 +474,8 @@ namespace FcitxCjkInput {
         }
 
         private static void BeforeDesktopTextField(Rect position, int id, GUIContent content,
-            bool multiline, int maxLength, GUIStyle style, TextEditor editor) {
+            bool multiline, int maxLength, GUIStyle style) {
+            var editor = (TextEditor)GUIUtility.GetStateObject(typeof(TextEditor), id);
             var target = ObserveEditor(id, editor);
             LogTextField("FIELD before-original", target, id, content, editor);
             if (target.Id == 0)
@@ -500,7 +507,8 @@ namespace FcitxCjkInput {
         }
 
         private static void AfterDesktopTextField(Rect position, int id, GUIContent content,
-            bool multiline, int maxLength, GUIStyle style, TextEditor editor) {
+            bool multiline, int maxLength, GUIStyle style) {
+            var editor = (TextEditor)GUIUtility.GetStateObject(typeof(TextEditor), id);
             var target = ObserveEditor(id, editor);
             LogTextField("FIELD after-original", target, id, content, editor);
             /*
