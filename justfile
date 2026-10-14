@@ -6,7 +6,7 @@ package_id := "scarf.cjkinput"
 mod_dest := rimworld + "/Mods/" + mod_name
 native_src := "native/fcitxcjkinput.c"
 native_test := "native/fcitxcjkinput_test.c"
-native_bin := "1.6/Assemblies/libfcitxcjkinput.so"
+native_bin := "1.7/Assemblies/libfcitxcjkinput.so"
 
 # Download Harmony
 prepare:
@@ -47,9 +47,9 @@ build: test test-native build-native build-dll
 # Install built mod to RimWorld Mods directory
 install: build
     @pgrep -x RimWorldLinux >/dev/null 2>&1 && { echo "RimWorld is running — 설치 전에 종료해주세요"; exit 1; } || true
-    mkdir -p "{{mod_dest}}/1.6/Assemblies"
+    mkdir -p "{{mod_dest}}/1.7/Assemblies"
     mkdir -p "{{mod_dest}}/About"
-    cp -r 1.6/Assemblies/* "{{mod_dest}}/1.6/Assemblies/"
+    cp -r 1.7/Assemblies/* "{{mod_dest}}/1.7/Assemblies/"
     cp -r About/* "{{mod_dest}}/About/"
     rm -rf "{{mod_dest}}/helper" "{{mod_dest}}/Languages"
     @echo "Installed to {{mod_dest}}"

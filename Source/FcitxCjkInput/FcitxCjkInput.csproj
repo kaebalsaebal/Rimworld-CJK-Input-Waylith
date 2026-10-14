@@ -8,7 +8,7 @@
     <AppDesignerFolder>Properties</AppDesignerFolder>
     <RootNamespace>FcitxCjkInput</RootNamespace>
     <AssemblyName>FcitxCjkInput</AssemblyName>
-    <TargetFramework>net472</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <FileAlignment>512</FileAlignment>
     <IsPublishable>false</IsPublishable>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
@@ -16,13 +16,16 @@
     <Deterministic>true</Deterministic>
     <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <SteamApps Condition="'$(SteamApps)' == ''">/home/deck/.local/share/Steam/steamapps</SteamApps>
+    <RimWorldDir>$(SteamApps)/common/RimWorld</RimWorldDir>
+    <HarmonyDir>$(SteamApps)/workshop/content/294100/2009463077/1.7/Assemblies</HarmonyDir>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <PlatformTarget>AnyCPU</PlatformTarget>
     <DebugSymbols>false</DebugSymbols>
     <DebugType>full</DebugType>
     <Optimize>false</Optimize>
-    <OutputPath>../../1.6/Assemblies</OutputPath>
+    <OutputPath>../../1.7/Assemblies</OutputPath>
     <DefineConstants>DEBUG;TRACE</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
@@ -33,41 +36,22 @@
     <DefineConstants>TRACE</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
-    <OutputPath>../../1.6/Assemblies/</OutputPath>
+    <OutputPath>../../1.7/Assemblies/</OutputPath>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="0Harmony">
-      <HintPath>$(MSBuildProjectDirectory)/../../packages/HarmonyMod/Current/Assemblies/0Harmony.dll</HintPath>
+      <HintPath>$(HarmonyDir)/0Harmony.dll</HintPath>
       <Private>False</Private>
     </Reference>
-  </ItemGroup>
-  <ItemGroup>
     <Reference Include="Assembly-CSharp">
-      <HintPath>$(STEAM_APPS)/common/RimWorld/$(STEAM_OS)/Managed/Assembly-CSharp.dll</HintPath>
+      <HintPath>$(RimWorldDir)/Assembly-CSharp.dll</HintPath>
       <Private>False</Private>
     </Reference>
-    <Reference Include="mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089" />
-    <Reference Include="System, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089" />
-    <Reference Include="System.Core, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"/>
-    <Reference Include="UnityEngine">
-      <HintPath>$(STEAM_APPS)/common/RimWorld/$(STEAM_OS)/Managed/UnityEngine.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
-    <Reference Include="UnityEngine.CoreModule">
-      <HintPath>$(STEAM_APPS)/common/RimWorld/$(STEAM_OS)/Managed/UnityEngine.CoreModule.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
-    <Reference Include="UnityEngine.IMGUIModule">
-      <HintPath>$(STEAM_APPS)/common/RimWorld/$(STEAM_OS)/Managed/UnityEngine.IMGUIModule.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
-    <Reference Include="UnityEngine.InputLegacyModule">
-      <HintPath>$(STEAM_APPS)/common/RimWorld/$(STEAM_OS)/Managed/UnityEngine.InputLegacyModule.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
-    <Reference Include="UnityEngine.TextRenderingModule">
-      <HintPath>$(STEAM_APPS)/common/RimWorld/$(STEAM_OS)/Managed/UnityEngine.TextRenderingModule.dll</HintPath>
+    <Reference Include="UnityStubs">
+      <HintPath>$(RimWorldDir)/UnityStubs.dll</HintPath>
       <Private>False</Private>
     </Reference>
   </ItemGroup>
+
+
 </Project>

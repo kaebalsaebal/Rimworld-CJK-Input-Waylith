@@ -7,10 +7,6 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
-using HarmonyLib;
-using RimWorld;
-using UnityEngine;
-using Verse;
 
 namespace FcitxCjkInput {
     [StaticConstructorOnStartup]
@@ -143,6 +139,7 @@ namespace FcitxCjkInput {
             var harmony = new Harmony("scarf.cjkinput");
             var rootOnGui = AccessTools.Method(typeof(Root), "OnGUI");
             var desktopTextField = AccessTools.Method(typeof(GUI), "HandleTextFieldEventForDesktop");
+            var drawTextAreaContent = AccessTools.Method(typeof(GUI), "DrawTextAreaContent");
             var quickSearch = AccessTools.Method(typeof(QuickSearchWidget), nameof(QuickSearchWidget.OnGUI));
             var searchTextSetter = AccessTools.PropertySetter(typeof(QuickSearchFilter),
                 nameof(QuickSearchFilter.Text));
@@ -156,6 +153,8 @@ namespace FcitxCjkInput {
                 throw new MissingMethodException("Verse.Root.OnGUI");
             if (desktopTextField == null)
                 throw new MissingMethodException("UnityEngine.GUI.HandleTextFieldEventForDesktop");
+            if (drawTextAreaContent == null)
+                throw new MissingMethodException("UnityEngine.GUI.DrawTextAreaContent");
             if (quickSearch == null)
                 throw new MissingMethodException("RimWorld.QuickSearchWidget.OnGUI");
             if (searchTextSetter == null)
@@ -173,6 +172,8 @@ namespace FcitxCjkInput {
             harmony.Patch(desktopTextField,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeDesktopTextField)),
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterDesktopTextField)));
+            harmony.Patch(drawTextAreaContent,
+                prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeDrawTextAreaContent)));
             harmony.Patch(quickSearch,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeQuickSearch)),
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterQuickSearch)));
@@ -197,7 +198,7 @@ namespace FcitxCjkInput {
             var content = LoadedModManager.RunningModsListForReading
                 .FirstOrDefault(mod => mod.assemblies.loadedAssemblies.Contains(assembly));
             var assemblyDirectory = content != null
-                ? Path.Combine(content.RootDir, "1.6", "Assemblies")
+                ? Path.Combine(content.RootDir, "1.7", "Assemblies")
                 : Path.GetDirectoryName(typeof(FcitxCjkInputMod).Assembly.Location);
             var path = Path.Combine(assemblyDirectory, NativeLibraryName);
             _nativeHandle = dlopen(path, RtldNow);
@@ -498,9 +499,11 @@ namespace FcitxCjkInput {
             bool multiline, int maxLength, GUIStyle style, TextEditor editor) {
             var target = ObserveEditor(id, editor);
             LogTextField("FIELD after-original", target, id, content, editor);
+            /*
             if (Event.current.type == EventType.Repaint && GUIUtility.keyboardControl == id &&
                 Composition.TryGetView(target, out var view))
                 DrawPreedit(editor, view);
+            */
 
             if (Event.current.type == EventType.Repaint && DebugLogging && _overlayFrame != Time.frameCount) {
                 _overlayFrame = Time.frameCount;
@@ -662,8 +665,9 @@ namespace FcitxCjkInput {
                 GUIUtility.hotControl + " contentObject=" + RuntimeHelpers.GetHashCode(content) +
                 " editorObject=" + RuntimeHelpers.GetHashCode(editor) + " content=[" +
                 Escape(content.text) + "] editor=[" + Escape(editor.text) + "] cursor=" +
-                editor.cursorIndex + " select=" + editor.selectIndex + " graphicalCursor=" +
-                editor.graphicalCursorPos + " multiline=" + editor.multiline + " guiChanged=" +
+                editor.cursorIndex + " select=" + editor.selectIndex +
+                //" graphicalCursor=" + editor.graphicalCursorPos +
+                " multiline=" + editor.multiline + " guiChanged=" +
                 GUI.changed + " " + DescribeEvent());
         }
 
@@ -688,6 +692,7 @@ namespace FcitxCjkInput {
                     "] event=" + Event.current.type);
         }
 
+        /*
         private static void DrawPreedit(TextEditor editor, CompositionView view) {
             var originalText = editor.text;
             var originalCursor = editor.cursorIndex;
@@ -716,6 +721,29 @@ namespace FcitxCjkInput {
                         editor.cursorIndex + " select=" + editor.selectIndex + " " +
                         DescribeEvent());
             }
+        }
+        */
+
+        private static void BeforeDrawTextAreaContent(ref string text, ref int caret, ref int selA, ref int selB, ref int compA, ref int compB) {
+            var id = GUIUtility.keyboardControl;
+            if (id == 0 ||
+                !ControlTokens.TryGetValue(id, out var target) ||
+                !Composition.TryGetView(target, out var view)) {
+                return;
+            }
+
+            var originalText = text ?? "";
+            var selectionStart = Math.Max(0, Math.Min(view.SelectionStart, originalText.Length));
+            var selectionEnd = Math.Max(selectionStart, Math.Min(view.SelectionEnd, originalText.Length));
+
+            text = TextEditMath.ReplaceRange(originalText, selectionStart, selectionEnd, view.Text);
+
+            caret = selectionStart + Math.Max(0, Math.Min(view.SelectionEnd, originalText.Length));
+
+            selA = caret;
+            selB = caret;
+            compA = selectionStart;
+            compB = selectionStart + view.Text.Length;
         }
 
         private static ControlToken ObserveEditor(int id, TextEditor editor) {

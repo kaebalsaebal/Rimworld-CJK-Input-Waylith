@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
 
 env:
-  RIMWORLD_VERSION: '1.6'
+  RIMWORLD_VERSION: '1.7'
   MOD_PACKAGE_ID: scarf.cjkinput
   SOLUTION_FILE: Source/FcitxCjkInput/FcitxCjkInput.csproj
-  ASSEMBLY_DIR: 1.6/Assemblies
+  ASSEMBLY_DIR: 1.7/Assemblies
   RIMWORLD_REF: /tmp/rimworld-refs
 
 jobs:
@@ -58,7 +58,7 @@ jobs:
 
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: '10.0.x'
 
       - name: build mod assembly (.dll)
         run: |
