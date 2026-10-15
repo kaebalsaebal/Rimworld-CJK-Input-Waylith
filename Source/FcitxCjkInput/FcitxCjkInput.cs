@@ -438,13 +438,9 @@ namespace FcitxCjkInput {
                 StartNativeBridge();
                 return;
             }
-            if (kind == "HANGUL_PREEDIT" || kind == "HANGUL_COMMIT") {
-                SetHangulEngine(contextId);
-                kind = kind == "HANGUL_PREEDIT" ? "PREEDIT" : "COMMIT";
-            }
             if (kind == "ENGINE") {
                 Engines[contextId] = payload;
-                if (payload != "hangul") {
+                if (!ImeRouting.IsImeEngine(payload)) {
                     Composition.CancelComposition(contextId);
                     GameplayKeys.Clear();
                     ClearShortcutComposition(contextId);
@@ -472,7 +468,6 @@ namespace FcitxCjkInput {
                 var keyValue = int.Parse(keyParts[0]);
                 var release = int.Parse(keyParts[1]) != 0;
                 var observedAt = long.Parse(keyParts[2]) * Stopwatch.Frequency / 1000L;
-                SetHangulEngine(contextId);
                 if (!release && (keyValue == 'z' || keyValue == 'Z'))
                     _lastZContext = contextId;
                 var gameplayBlocked = _textFieldActive || IsSearchWidgetFocused();
@@ -523,8 +518,7 @@ namespace FcitxCjkInput {
                     return;
                 }
                 Engines.TryGetValue(contextId, out var engine);
-                if (ImeRouting.IsImeEngine(engine) &&
-                    (engine == "hangul" || ContainsNonAscii(text)) && text.Length > 0 &&
+                if (ImeRouting.ShouldAcceptCommit(engine, text) &&
                     Composition.Commit(contextId, sequence, text, now)) {
                     if (DebugLogging)
                         WriteLog("QUEUE commit context=" + contextId + " sequence=" + sequence +
@@ -547,12 +541,6 @@ namespace FcitxCjkInput {
                 _unboundPreeditContext = 0;
                 _unboundPreedit = "";
             }
-        }
-
-        private static void SetHangulEngine(int contextId) {
-            Engines[contextId] = "hangul";
-            if (Composition.ActiveContext == 0 || Composition.ActiveContext == contextId)
-                SetEngine("hangul");
         }
 
         private static void SetEngine(string engine) {
@@ -728,7 +716,7 @@ namespace FcitxCjkInput {
             var currentEvent = Event.current;
             if (!IsSearchWidgetFocused())
                 ProcessNativeKeyEvent(currentEvent, "text-field");
-            SuppressRawHangulKey(id);
+            SuppressRawImeKey(id);
             if (!IsSearchWidgetFocused() && currentEvent != null &&
                 ProcessNativeTextCharacter(currentEvent, "text-field"))
                 currentEvent.Use();
@@ -791,7 +779,7 @@ namespace FcitxCjkInput {
 
             var currentEvent = Event.current;
             ProcessNativeKeyEvent(currentEvent, "text-field-impl");
-            SuppressRawHangulKey(id);
+            SuppressRawImeKey(id);
             if (currentEvent != null && !IsSearchWidgetFocused() &&
                 ProcessNativeTextCharacter(currentEvent, "text-field-impl"))
                 currentEvent.Use();
@@ -1101,16 +1089,16 @@ namespace FcitxCjkInput {
                 binding == KeyBindingDefOf.MapDolly_Down;
         }
 
-        private static void SuppressRawHangulKey(int id) {
+        private static void SuppressRawImeKey(int id) {
             var currentEvent = Event.current;
-            var letter = IsHangulLetter(currentEvent.keyCode);
+            var letter = IsLatinLetterKey(currentEvent.keyCode);
             var backspace = currentEvent.keyCode == KeyCode.Backspace;
             if (currentEvent.type != EventType.KeyDown || (!letter && !backspace))
                 return;
             var shortcutModifiers = EventModifiers.Control | EventModifiers.Command | EventModifiers.Alt;
             var suppress = InputSuppression.ShouldSuppress(
                 focusedTextField: GUIUtility.keyboardControl == id,
-                hangul: _engine == "hangul",
+                imeActive: ImeRouting.IsImeEngine(_engine),
                 letter: letter,
                 backspace: backspace,
                 hasPreedit: Composition.HasPreedit,
@@ -1606,16 +1594,8 @@ namespace FcitxCjkInput {
             return insertedLength;
         }
 
-        private static bool IsHangulLetter(KeyCode keyCode) {
+        private static bool IsLatinLetterKey(KeyCode keyCode) {
             return keyCode >= KeyCode.A && keyCode <= KeyCode.Z;
-        }
-
-        private static bool ContainsNonAscii(string text) {
-            foreach (var character in text) {
-                if (character > 127)
-                    return true;
-            }
-            return false;
         }
 
         private static string DecodeHex(string hex) {

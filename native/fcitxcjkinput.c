@@ -12,8 +12,8 @@
  * Queue messages:
  *   READY:<rimworld-pid>
  *   EVENT:<context-id>:<sequence>:ENGINE:<unique-name>
- *   EVENT:<context-id>:<sequence>:PREEDIT|HANGUL_PREEDIT:<UTF-8 byte cursor>:<UTF-8 hex>
- *   EVENT:<context-id>:<sequence>:COMMIT|HANGUL_COMMIT:<UTF-8 hex>
+ *   EVENT:<context-id>:<sequence>:PREEDIT:<UTF-8 byte cursor>:<UTF-8 hex>
+ *   EVENT:<context-id>:<sequence>:COMMIT:<UTF-8 hex>
  *   EVENT:<context-id>:<sequence>:FOCUS:IN|OUT
  *   EVENT:<context-id>:<sequence>:KEY:<ASCII key value>:<release 0|1>:<monotonic ms>
  *   EVENT:<context-id>:<sequence>:KEYRESET:<reason>
@@ -51,7 +51,7 @@
 struct context_entry {
     char destination[128];
     char path[256];
-    int hangul;
+    int ime_active;
 };
 
 struct pending_key {
@@ -347,7 +347,7 @@ static uint32_t context_id(DBusMessage *message) {
     struct context_entry *entry = &contexts[context_count++];
     snprintf(entry->destination, sizeof(entry->destination), "%s", client);
     snprintf(entry->path, sizeof(entry->path), "%s", path);
-    entry->hangul = 0;
+    entry->ime_active = 0;
     enqueue_message("LOG:context id=%zu destination=%s path=%s",
         context_count, client, path);
     return (uint32_t)context_count;
@@ -415,6 +415,11 @@ static int is_recoverable_key(uint32_t keyval) {
         keyval == 'z' || keyval == 'Z';
 }
 
+static int is_ime_engine(const char *unique_name) {
+    return unique_name && unique_name[0] && strcmp(unique_name, "unknown") != 0 &&
+        strncmp(unique_name, "keyboard", 8) != 0;
+}
+
 static struct pending_key *find_pending_key(const char *client, uint32_t serial) {
     for (size_t i = 0; i < MAX_PENDING_KEYS; i++) {
         if (pending_keys[i].serial == serial &&
@@ -474,7 +479,7 @@ static void handle_process_key(DBusMessage *message, uint32_t context,
         return;
     }
     const uint64_t observed_at_ms = monotonic_millis();
-    const int recoverable = contexts[context - 1].hangul &&
+    const int recoverable = contexts[context - 1].ime_active &&
         is_recoverable_key(keyval);
     if (recoverable && release) {
         cancel_pending_key(context, keycode);
@@ -498,9 +503,9 @@ static void handle_process_key(DBusMessage *message, uint32_t context,
         pending->recover = recover;
         pending->canceled = 0;
     }
-    enqueue_message("LOG:ProcessKeyEvent serial=%u context=%u keyval=%u keycode=%u state=%u release=%d time=%u hangul=%d recover=%d",
+    enqueue_message("LOG:ProcessKeyEvent serial=%u context=%u keyval=%u keycode=%u state=%u release=%d time=%u ime_active=%d recover=%d",
         serial, context, keyval, keycode, state, release, time,
-        contexts[context - 1].hangul, recover);
+        contexts[context - 1].ime_active, recover);
 }
 
 static void handle_process_key_reply(DBusMessage *message,
@@ -587,9 +592,10 @@ static void handle_message(DBusMessage *message, int from_input_connection) {
                 DBUS_TYPE_STRING, &unique_name,
                 DBUS_TYPE_STRING, &language,
                 DBUS_TYPE_INVALID)) {
-            if (strcmp(unique_name, "hangul") != 0)
+            const int ime_active = is_ime_engine(unique_name);
+            if (!ime_active)
                 cancel_pending_context(context);
-            contexts[context - 1].hangul = strcmp(unique_name, "hangul") == 0;
+            contexts[context - 1].ime_active = ime_active;
             enqueue_message("LOG:CurrentIM context=%u name=%s unique=%s lang=%s",
                 context, name, unique_name, language);
             enqueue_message("EVENT:%u:%llu:ENGINE:%s", context, sequence, unique_name);
@@ -604,9 +610,8 @@ static void handle_message(DBusMessage *message, int from_input_connection) {
             enqueue_message("LOG:CommitString context=%u bytes=%zu text=%s",
                 context, strlen(text), text);
             char prefix[96];
-            snprintf(prefix, sizeof(prefix), "EVENT:%u:%llu:%s",
-                context, sequence,
-                contexts[context - 1].hangul ? "HANGUL_COMMIT" : "COMMIT");
+            snprintf(prefix, sizeof(prefix), "EVENT:%u:%llu:COMMIT",
+                context, sequence);
             enqueue_hex(prefix, text);
         }
     } else if (strcmp(member, "UpdateFormattedPreedit") == 0) {
@@ -617,8 +622,7 @@ static void handle_message(DBusMessage *message, int from_input_connection) {
                 context, cursor, strlen(text), text);
             char prefix[96];
             snprintf(prefix, sizeof(prefix), "EVENT:%u:%llu:%s:%d",
-                context, sequence,
-                contexts[context - 1].hangul ? "HANGUL_PREEDIT" : "PREEDIT", cursor);
+                context, sequence, "PREEDIT", cursor);
             enqueue_hex(prefix, text);
         } else {
             enqueue_message("ERROR:Preedit context=%u parse failed", context);

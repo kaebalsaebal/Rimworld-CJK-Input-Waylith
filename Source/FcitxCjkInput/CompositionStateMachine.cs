@@ -27,15 +27,19 @@ namespace FcitxCjkInput {
         }
 
         public static bool IsImeEngine(string engine) {
-            return !string.IsNullOrEmpty(engine) &&
+            return !string.IsNullOrEmpty(engine) && engine != "unknown" &&
                 !engine.StartsWith("keyboard", StringComparison.Ordinal);
+        }
+
+        public static bool ShouldAcceptCommit(string engine, string text) {
+            return IsImeEngine(engine) && !string.IsNullOrEmpty(text);
         }
     }
 
     internal static class InputSuppression {
-        public static bool ShouldSuppress(bool focusedTextField, bool hangul, bool letter,
+        public static bool ShouldSuppress(bool focusedTextField, bool imeActive, bool letter,
             bool backspace, bool hasPreedit, bool shortcut) {
-            return focusedTextField && hangul &&
+            return focusedTextField && imeActive &&
                 ((letter && !shortcut) || (backspace && hasPreedit));
         }
     }

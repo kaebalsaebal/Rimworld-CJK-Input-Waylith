@@ -10,15 +10,15 @@ internal static class Program {
             ImeActivationTracksFreshTextFieldFocus,
             CjkEngineCommitsAreAccepted,
             GameplayKeysRemainAvailableOutsideTextFields,
-            TextFieldRawHangulKeysAreSuppressed,
+            TextFieldRawImeKeysAreSuppressed,
             BackspaceSuppressionRequiresFocusedPreedit,
             CommittedCharacterIsSuppressedOnce,
             MultipleCommittedCharactersAreSuppressedInOrder,
             DifferentCharacterIsNotSuppressedLater,
             CommittedCharacterSuppressionExpires,
-            RecoveredSearchShortcutDiscardsItsHangulCommit,
-            HangulDirectionalKeysRecoverCameraInput,
-            HangulShortcutPressesAreConsumedWithoutUnityKeyDownEvent,
+            RecoveredSearchShortcutDiscardsItsImeCommit,
+            ImeDirectionalKeysRecoverCameraInput,
+            ImeShortcutPressesAreConsumedWithoutUnityKeyDownEvent,
             ShortcutPressesExpireInsteadOfFiringLater,
             ShortcutPressQueueIsBounded,
             UnrelatedKeysAreNotRecovered,
@@ -58,17 +58,28 @@ internal static class Program {
         Equal(true, ImeRouting.IsImeEngine("hangul"));
         Equal(true, ImeRouting.IsImeEngine("rime"));
         Equal(true, ImeRouting.IsImeEngine("pinyin"));
+        Equal(true, ImeRouting.IsImeEngine("mozc"));
         Equal(false, ImeRouting.IsImeEngine("keyboard-us"));
+        Equal(false, ImeRouting.IsImeEngine("keyboard-kr-kr104"));
         Equal(false, ImeRouting.IsImeEngine("keyboard-cn"));
+        Equal(false, ImeRouting.IsImeEngine("unknown"));
         Equal(false, ImeRouting.IsImeEngine(null));
         Equal(false, ImeRouting.IsImeEngine(""));
+
+        Equal(true, ImeRouting.ShouldAcceptCommit("hangul", "가"));
+        Equal(true, ImeRouting.ShouldAcceptCommit("rime", "你"));
+        Equal(true, ImeRouting.ShouldAcceptCommit("mozc", "かな"));
+        Equal(true, ImeRouting.ShouldAcceptCommit("mozc", "romaji"));
+        Equal(false, ImeRouting.ShouldAcceptCommit("keyboard-jp", "かな"));
+        Equal(false, ImeRouting.ShouldAcceptCommit("unknown", "text"));
+        Equal(false, ImeRouting.ShouldAcceptCommit("rime", ""));
     }
 
     private static void GameplayKeysRemainAvailableOutsideTextFields() {
         Equal(false, InputSuppression.ShouldSuppress(false, true, true, false, false, false));
     }
 
-    private static void TextFieldRawHangulKeysAreSuppressed() {
+    private static void TextFieldRawImeKeysAreSuppressed() {
         Equal(true, InputSuppression.ShouldSuppress(true, true, true, false, false, false));
         Equal(false, InputSuppression.ShouldSuppress(true, false, true, false, false, false));
         Equal(false, InputSuppression.ShouldSuppress(true, true, true, false, false, true));
@@ -116,7 +127,7 @@ internal static class Program {
         Equal(false, tracker.ShouldSuppress(target, '메', 12));
     }
 
-    private static void RecoveredSearchShortcutDiscardsItsHangulCommit() {
+    private static void RecoveredSearchShortcutDiscardsItsImeCommit() {
         var guard = new ShortcutCommitGuard();
         guard.Arm(1, "ㅋ");
 
@@ -129,7 +140,7 @@ internal static class Program {
         Equal(false, guard.ShouldDiscard(1, "ㅋ"));
     }
 
-    private static void HangulDirectionalKeysRecoverCameraInput() {
+    private static void ImeDirectionalKeysRecoverCameraInput() {
         var keys = new GameplayKeyState(Lifetime);
         keys.Update('w', false, 100);
 
@@ -137,7 +148,7 @@ internal static class Program {
         Equal(false, GameplayKeyRecovery.ShouldRecover(false, false, false, 'w', 0, keys));
     }
 
-    private static void HangulShortcutPressesAreConsumedWithoutUnityKeyDownEvent() {
+    private static void ImeShortcutPressesAreConsumedWithoutUnityKeyDownEvent() {
         var keys = new GameplayKeyState(Lifetime);
         keys.Update('q', false, 100);
         keys.Update('q', true, 101);

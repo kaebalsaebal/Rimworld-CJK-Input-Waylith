@@ -54,7 +54,7 @@ static void handle_commit(const char *text) {
     assert(dbus_message_append_args(message,
         DBUS_TYPE_STRING, &text,
         DBUS_TYPE_INVALID));
-    handle_message(message);
+    handle_message(message, 0);
     dbus_message_unref(message);
 }
 
@@ -92,7 +92,13 @@ static void expect_no_message(void) {
 
 int main(void) {
     atomic_store_explicit(&debug_logging, 0, memory_order_relaxed);
-    contexts[0].hangul = 1;
+    assert(!is_ime_engine("keyboard-us"));
+    assert(!is_ime_engine("keyboard-kr-kr104"));
+    assert(!is_ime_engine("unknown"));
+    assert(is_ime_engine("hangul"));
+    assert(is_ime_engine("rime"));
+    assert(is_ime_engine("mozc"));
+    contexts[0].ime_active = 1;
     snprintf(contexts[0].destination, sizeof(contexts[0].destination), "%s", CLIENT);
     snprintf(contexts[0].path, sizeof(contexts[0].path), "%s", "/inputcontext_1");
     context_count = 1;
@@ -142,7 +148,7 @@ int main(void) {
     handle_key('r', FALSE, 26, 26);
     expect_no_message();
 
-    contexts[0].hangul = 0;
+    contexts[0].ime_active = 0;
     handle_key('a', FALSE, 27, 27);
     expect_no_message();
 
@@ -156,9 +162,9 @@ int main(void) {
     expect_message("EVENT:0:0:RESET:queue-drop");
     expect_no_message();
 
-    contexts[0].hangul = 1;
+    contexts[0].ime_active = 1;
     next_sequence = 30;
     handle_commit("가");
-    expect_message("EVENT:1:31:HANGUL_COMMIT:EAB080");
+    expect_message("EVENT:1:31:COMMIT:EAB080");
     return 0;
 }
