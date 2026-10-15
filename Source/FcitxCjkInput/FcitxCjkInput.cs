@@ -622,7 +622,7 @@ namespace FcitxCjkInput {
             }
 
             UpdateNativeFocus(true);
-            var state = WaylithModifierState(__instance);
+            var state = RemoveRightAltSelfState(keyName, WaylithModifierState(__instance));
             var modifier = IsModifierKeysym(keyval);
             var release = !down;
             var accepted = false;
@@ -1189,7 +1189,8 @@ namespace FcitxCjkInput {
                 return false;
 
             var keyName = currentEvent.keyCode.ToString();
-            var state = FcitxModifierState(currentEvent.modifiers);
+            var state = RemoveRightAltSelfState(keyName,
+                FcitxModifierState(currentEvent.modifiers));
             if (!release) {
                 var keyDownState = RemoveModifierSelfState(keyval, state);
                 var accepted = SendNativeKey(keyval, keyDownState, release: false);
@@ -1365,7 +1366,10 @@ namespace FcitxCjkInput {
                 case "RightControl": keyval = 0xffe4; return true;
                 case "RightCtrl": keyval = 0xffe4; return true;
                 case "LeftAlt": keyval = 0xffe9; return true;
-                case "RightAlt": keyval = 0xffea; return true;
+                case "RightAlt":
+                    keyval = ImeRouting.RightAltKeysym(
+                        FcitxCjkInputEntry.Settings?.RightAltMode ?? RightAltKeyMode.AltRight);
+                    return true;
                 case "LeftCommand": keyval = 0xffeb; return true;
                 case "LeftMeta":
                 case "LeftSuper": keyval = 0xffeb; return true;
@@ -1424,6 +1428,14 @@ namespace FcitxCjkInput {
             if ((modifiers & EventModifiers.Control) != 0) state |= 1u << 2;
             if ((modifiers & EventModifiers.Alt) != 0) state |= 1u << 3;
             if ((modifiers & EventModifiers.Command) != 0) state |= 1u << 6;
+            return state;
+        }
+
+        private static uint RemoveRightAltSelfState(string keyName, uint state) {
+            if (keyName == "RightAlt" &&
+                (FcitxCjkInputEntry.Settings?.RightAltMode ?? RightAltKeyMode.AltRight) !=
+                    RightAltKeyMode.AltRight)
+                return state & ~((1u << 3) | (1u << 7));
             return state;
         }
 

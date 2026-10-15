@@ -66,6 +66,20 @@ internal static class Program {
         Equal(false, ImeRouting.IsImeEngine(null));
         Equal(false, ImeRouting.IsImeEngine(""));
 
+        Equal(0xffeau, ImeRouting.RightAltKeysym(RightAltKeyMode.AltRight));
+        Equal(0xff31u, ImeRouting.RightAltKeysym(RightAltKeyMode.Hangul));
+        Equal(0xff34u, ImeRouting.RightAltKeysym(RightAltKeyMode.HangulHanja));
+        Equal(0xff21u, ImeRouting.RightAltKeysym(RightAltKeyMode.Kanji));
+        Equal(0xff22u, ImeRouting.RightAltKeysym(RightAltKeyMode.Muhenkan));
+        Equal(0xff23u, ImeRouting.RightAltKeysym(RightAltKeyMode.Henkan));
+        Equal(0xff27u, ImeRouting.RightAltKeysym(RightAltKeyMode.HiraganaKatakana));
+        Equal(0xff2au, ImeRouting.RightAltKeysym(RightAltKeyMode.ZenkakuHankaku));
+        Equal(0xff2du, ImeRouting.RightAltKeysym(RightAltKeyMode.KanaLock));
+        Equal(0xff2eu, ImeRouting.RightAltKeysym(RightAltKeyMode.KanaShift));
+        Equal(0xff2fu, ImeRouting.RightAltKeysym(RightAltKeyMode.EisuShift));
+        Equal(0xff30u, ImeRouting.RightAltKeysym(RightAltKeyMode.EisuToggle));
+        Equal(0xff7eu, ImeRouting.RightAltKeysym(RightAltKeyMode.ModeSwitch));
+
         Equal(true, ImeRouting.ShouldAcceptCommit("hangul", "가"));
         Equal(true, ImeRouting.ShouldAcceptCommit("rime", "你"));
         Equal(true, ImeRouting.ShouldAcceptCommit("mozc", "かな"));
