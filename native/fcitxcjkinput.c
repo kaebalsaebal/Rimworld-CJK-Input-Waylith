@@ -4,6 +4,9 @@
  * Public API:
  *   int fcitx_bridge_start(uint32_t rimworld_pid)
  *   int fcitx_bridge_poll(char *buffer, int capacity)
+ *   int fcitx_bridge_set_focus(int focused)
+ *   int fcitx_bridge_process_key(uint32_t keyval, uint32_t keycode,
+ *       uint32_t state, int release, uint32_t time)
  *   void fcitx_bridge_stop(void)
  *
  * Queue messages:
@@ -34,6 +37,9 @@
 #include <unistd.h>
 
 #define EXPORT __attribute__((visibility("default")))
+#define FCITX_SERVICE "org.fcitx.Fcitx5"
+#define FCITX_INPUT_METHOD_PATH "/org/freedesktop/portal/inputmethod"
+#define FCITX_INPUT_METHOD_INTERFACE "org.fcitx.Fcitx.InputMethod1"
 #define INPUT_CONTEXT_INTERFACE "org.fcitx.Fcitx.InputContext1"
 #define MAX_TEXT 4096
 #define MAX_MESSAGE 16384
@@ -68,6 +74,7 @@ struct message_node {
 
 static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct message_node *queue_head;
 static struct message_node *queue_tail;
 static size_t queue_count;
@@ -81,6 +88,10 @@ static atomic_int queue_desynced;
 static uint32_t rimworld_pid;
 
 static DBusConnection *connection;
+static DBusConnection *input_connection;
+static char input_destination[128];
+static char input_context_path[256];
+static atomic_int input_context_ready;
 static char rimworld_destinations[MAX_DESTINATIONS][128];
 static size_t rimworld_destination_count;
 static struct context_entry contexts[MAX_CONTEXTS];
@@ -305,6 +316,7 @@ static const char *client_name(DBusMessage *message) {
 
 static int is_rimworld_destination(const char *client) {
     if (!client || client[0] != ':') return 0;
+    if (input_destination[0] && strcmp(input_destination, client) == 0) return 1;
     for (size_t i = 0; i < rimworld_destination_count; i++) {
         if (strcmp(client, rimworld_destinations[i]) == 0) return 1;
     }
@@ -313,6 +325,11 @@ static int is_rimworld_destination(const char *client) {
 
 static int is_rimworld_message(DBusMessage *message) {
     return is_rimworld_destination(client_name(message));
+}
+
+static int is_direct_input_context_message(DBusMessage *message) {
+    const char *path = dbus_message_get_path(message);
+    return path && input_context_path[0] && strcmp(path, input_context_path) == 0;
 }
 
 static uint32_t context_id(DBusMessage *message) {
@@ -524,7 +541,17 @@ static void handle_process_key_reply(DBusMessage *message,
     pending->serial = 0;
 }
 
-static void handle_message(DBusMessage *message) {
+static void handle_message(DBusMessage *message, int from_input_connection) {
+    const int direct_context_ready = atomic_load_explicit(&input_context_ready,
+        memory_order_relaxed);
+    /*
+     * The monitor connection sees the same D-Bus traffic as the direct client
+     * connection. Once we own an input context, process its signals only from
+     * that client connection or preedit/commit events would be queued twice.
+     */
+    if (direct_context_ready && (!from_input_connection ||
+        !is_direct_input_context_message(message)))
+        return;
     const int type = dbus_message_get_type(message);
     if (type == DBUS_MESSAGE_TYPE_METHOD_RETURN || type == DBUS_MESSAGE_TYPE_ERROR) {
         handle_process_key_reply(message, ++next_sequence);
@@ -610,8 +637,255 @@ static void close_connection(void) {
     connection = NULL;
 }
 
+static DBusMessage *call_input_context(const char *member, DBusMessage *request,
+    int timeout_ms, DBusError *error) {
+    if (!input_connection || !input_context_path[0]) return NULL;
+    if (!request) return NULL;
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(
+        input_connection, request, timeout_ms, error);
+    dbus_message_unref(request);
+    if (!reply)
+        enqueue_message("ERROR:input context member=%s error=%s", member,
+            dbus_error_is_set(error) ? error->message : "no reply");
+    return reply;
+}
+
+static int send_input_context_noargs(const char *member, int timeout_ms) {
+    DBusMessage *request = dbus_message_new_method_call(FCITX_SERVICE,
+        input_context_path, INPUT_CONTEXT_INTERFACE, member);
+    if (!request) return 0;
+    DBusError error;
+    dbus_error_init(&error);
+    DBusMessage *reply = call_input_context(member, request, timeout_ms, &error);
+    if (!reply) {
+        dbus_error_free(&error);
+        return 0;
+    }
+    dbus_message_unref(reply);
+    dbus_error_free(&error);
+    return 1;
+}
+
+static int create_input_context(void) {
+    DBusError error;
+    dbus_error_init(&error);
+    input_connection = dbus_bus_get_private(DBUS_BUS_SESSION, &error);
+    if (!input_connection) {
+        enqueue_message("ERROR:input session bus error=%s",
+            dbus_error_is_set(&error) ? error.message : "unknown");
+        dbus_error_free(&error);
+        return 0;
+    }
+    dbus_connection_set_exit_on_disconnect(input_connection, FALSE);
+    const char *unique_name = dbus_bus_get_unique_name(input_connection);
+    if (!unique_name || unique_name[0] != ':') {
+        enqueue_message("ERROR:input connection has no unique bus name");
+        dbus_error_free(&error);
+        return 0;
+    }
+    snprintf(input_destination, sizeof(input_destination), "%s", unique_name);
+
+    DBusMessage *request = dbus_message_new_method_call(FCITX_SERVICE,
+        FCITX_INPUT_METHOD_PATH, FCITX_INPUT_METHOD_INTERFACE, "CreateInputContext");
+    if (!request) {
+        dbus_error_free(&error);
+        return 0;
+    }
+    DBusMessageIter root;
+    DBusMessageIter attributes;
+    dbus_message_iter_init_append(request, &root);
+    if (!dbus_message_iter_open_container(&root, DBUS_TYPE_ARRAY, "(ss)", &attributes)) {
+        dbus_message_unref(request);
+        dbus_error_free(&error);
+        return 0;
+    }
+
+    const char *display = getenv("WAYLAND_DISPLAY");
+    if (!display || !display[0]) display = getenv("DISPLAY");
+    if (!display || !display[0]) display = "rimworld-waylith";
+    const char *attribute_name = "display";
+    DBusMessageIter display_pair;
+    dbus_message_iter_open_container(&attributes, DBUS_TYPE_STRUCT, NULL, &display_pair);
+    dbus_message_iter_append_basic(&display_pair, DBUS_TYPE_STRING, &attribute_name);
+    dbus_message_iter_append_basic(&display_pair, DBUS_TYPE_STRING, &display);
+    dbus_message_iter_close_container(&attributes, &display_pair);
+    attribute_name = "program";
+    const char *program = "RimWorld-Waylith";
+    DBusMessageIter program_pair;
+    dbus_message_iter_open_container(&attributes, DBUS_TYPE_STRUCT, NULL, &program_pair);
+    dbus_message_iter_append_basic(&program_pair, DBUS_TYPE_STRING, &attribute_name);
+    dbus_message_iter_append_basic(&program_pair, DBUS_TYPE_STRING, &program);
+    dbus_message_iter_close_container(&attributes, &program_pair);
+    dbus_message_iter_close_container(&root, &attributes);
+
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(
+        input_connection, request, 1000, &error);
+    dbus_message_unref(request);
+    if (!reply) {
+        enqueue_message("ERROR:CreateInputContext error=%s",
+            dbus_error_is_set(&error) ? error.message : "no reply");
+        dbus_error_free(&error);
+        return 0;
+    }
+    DBusMessageIter result;
+    if (!dbus_message_iter_init(reply, &result) ||
+        dbus_message_iter_get_arg_type(&result) != DBUS_TYPE_OBJECT_PATH) {
+        enqueue_message("ERROR:CreateInputContext invalid reply signature");
+        dbus_message_unref(reply);
+        dbus_error_free(&error);
+        return 0;
+    }
+    const char *path = NULL;
+    dbus_message_iter_get_basic(&result, &path);
+    snprintf(input_context_path, sizeof(input_context_path), "%s", path ? path : "");
+    dbus_message_unref(reply);
+    if (!input_context_path[0]) {
+        enqueue_message("ERROR:CreateInputContext returned an empty path");
+        dbus_error_free(&error);
+        return 0;
+    }
+
+    char rule[512];
+    snprintf(rule, sizeof(rule),
+        "type='signal',sender='%s',path='%s',interface='%s'",
+        FCITX_SERVICE, input_context_path, INPUT_CONTEXT_INTERFACE);
+    dbus_bus_add_match(input_connection, rule, &error);
+    if (dbus_error_is_set(&error)) {
+        enqueue_message("ERROR:AddMatch input context error=%s", error.message);
+        dbus_error_free(&error);
+        return 0;
+    }
+    dbus_connection_flush(input_connection);
+
+    pthread_mutex_lock(&input_mutex);
+    DBusMessage *capability_request = dbus_message_new_method_call(FCITX_SERVICE,
+        input_context_path, INPUT_CONTEXT_INTERFACE, "SetCapability");
+    if (capability_request) {
+        const uint64_t capabilities = (UINT64_C(1) << 1) | (UINT64_C(1) << 4) |
+            (UINT64_C(1) << 5) | (UINT64_C(1) << 23) | (UINT64_C(1) << 37) |
+            (UINT64_C(1) << 38);
+        dbus_message_append_args(capability_request, DBUS_TYPE_UINT64, &capabilities,
+            DBUS_TYPE_INVALID);
+        DBusMessage *capability_reply = dbus_connection_send_with_reply_and_block(
+            input_connection, capability_request, 1000, &error);
+        dbus_message_unref(capability_request);
+        if (!capability_reply) {
+            enqueue_message("ERROR:SetCapability error=%s",
+                dbus_error_is_set(&error) ? error.message : "no reply");
+            pthread_mutex_unlock(&input_mutex);
+            dbus_error_free(&error);
+            return 0;
+        }
+        dbus_message_unref(capability_reply);
+    }
+    pthread_mutex_unlock(&input_mutex);
+    dbus_error_free(&error);
+
+    atomic_store_explicit(&input_context_ready, 1, memory_order_relaxed);
+    enqueue_message("LOG:input context ready destination=%s path=%s display=%s",
+        input_destination, input_context_path, display);
+    return 1;
+}
+
+static void close_input_connection(void) {
+    pthread_mutex_lock(&input_mutex);
+    atomic_store_explicit(&input_context_ready, 0, memory_order_relaxed);
+    if (input_connection && input_context_path[0]) {
+        send_input_context_noargs("FocusOut", 200);
+        send_input_context_noargs("DestroyIC", 200);
+    }
+    if (input_connection) {
+        dbus_connection_close(input_connection);
+        dbus_connection_unref(input_connection);
+        input_connection = NULL;
+    }
+    input_context_path[0] = '\0';
+    input_destination[0] = '\0';
+    pthread_mutex_unlock(&input_mutex);
+}
+
+static int pump_input_connection(void) {
+    DBusMessage *messages[32];
+    size_t count = 0;
+    pthread_mutex_lock(&input_mutex);
+    const int connected = input_connection && dbus_connection_read_write(input_connection, 10);
+    if (connected) {
+        while (count < sizeof(messages) / sizeof(messages[0])) {
+            DBusMessage *message = dbus_connection_pop_message(input_connection);
+            if (!message) break;
+            messages[count++] = message;
+        }
+    }
+    pthread_mutex_unlock(&input_mutex);
+    for (size_t i = 0; i < count; i++) {
+        handle_message(messages[i], 1);
+        dbus_message_unref(messages[i]);
+    }
+    return connected;
+}
+
+EXPORT int fcitx_bridge_set_focus(int focused) {
+    if (!atomic_load_explicit(&input_context_ready, memory_order_relaxed)) return ENOTCONN;
+    pthread_mutex_lock(&input_mutex);
+    const int result = send_input_context_noargs(focused ? "FocusIn" : "FocusOut", 250);
+    pthread_mutex_unlock(&input_mutex);
+    if (result)
+        enqueue_message("LOG:input focus %s", focused ? "in" : "out");
+    return result ? 0 : EIO;
+}
+
+EXPORT int fcitx_bridge_process_key(uint32_t keyval, uint32_t keycode,
+    uint32_t state, int release, uint32_t time) {
+    if (!atomic_load_explicit(&input_context_ready, memory_order_relaxed)) return -1;
+    pthread_mutex_lock(&input_mutex);
+    DBusMessage *request = dbus_message_new_method_call(FCITX_SERVICE,
+        input_context_path, INPUT_CONTEXT_INTERFACE, "ProcessKeyEvent");
+    if (!request) {
+        pthread_mutex_unlock(&input_mutex);
+        return -1;
+    }
+    const dbus_bool_t is_release = release ? TRUE : FALSE;
+    dbus_message_append_args(request,
+        DBUS_TYPE_UINT32, &keyval,
+        DBUS_TYPE_UINT32, &keycode,
+        DBUS_TYPE_UINT32, &state,
+        DBUS_TYPE_BOOLEAN, &is_release,
+        DBUS_TYPE_UINT32, &time,
+        DBUS_TYPE_INVALID);
+    DBusError error;
+    dbus_error_init(&error);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(
+        input_connection, request, 100, &error);
+    dbus_message_unref(request);
+    if (!reply) {
+        enqueue_message("ERROR:ProcessKeyEvent keyval=%u state=%u release=%d error=%s",
+            keyval, state, release,
+            dbus_error_is_set(&error) ? error.message : "no reply");
+        dbus_error_free(&error);
+        pthread_mutex_unlock(&input_mutex);
+        return -1;
+    }
+    dbus_bool_t accepted = FALSE;
+    const int valid_reply = dbus_message_get_args(reply, &error,
+        DBUS_TYPE_BOOLEAN, &accepted, DBUS_TYPE_INVALID);
+    dbus_message_unref(reply);
+    if (!valid_reply) {
+        enqueue_message("ERROR:ProcessKeyEvent invalid reply error=%s",
+            dbus_error_is_set(&error) ? error.message : "invalid reply");
+        dbus_error_free(&error);
+        pthread_mutex_unlock(&input_mutex);
+        return -1;
+    }
+    dbus_error_free(&error);
+    pthread_mutex_unlock(&input_mutex);
+    enqueue_message("LOG:InputKey keyval=%u keycode=%u state=%u release=%d accepted=%d",
+        keyval, keycode, state, release, accepted);
+    return accepted ? 1 : 0;
+}
+
 static void *monitor_worker(void *unused) {
     (void)unused;
+    int monitor_active = 0;
 
     DBusError error;
     dbus_error_init(&error);
@@ -624,25 +898,32 @@ static void *monitor_worker(void *unused) {
     }
     dbus_connection_set_exit_on_disconnect(connection, FALSE);
 
-    if (!discover_rimworld_destinations()) {
-        enqueue_message("ERROR:no D-Bus destination for pid=%u", rimworld_pid);
-        goto stopped;
+    if (discover_rimworld_destinations()) {
+        monitor_active = become_monitor();
+    } else {
+        enqueue_message("LOG:no existing game D-Bus client; using direct input context");
     }
-    if (!become_monitor()) goto stopped;
+    if (!monitor_active)
+        enqueue_message("LOG:passive D-Bus monitor unavailable; direct input remains enabled");
+    if (!create_input_context()) goto stopped;
 
     enqueue_message("READY:%u", rimworld_pid);
     while (atomic_load_explicit(&running, memory_order_relaxed) &&
         !atomic_load_explicit(&restart_requested, memory_order_relaxed) &&
         kill((pid_t)rimworld_pid, 0) == 0) {
-        if (!dbus_connection_read_write(connection, 250)) break;
-        DBusMessage *message;
-        while ((message = dbus_connection_pop_message(connection)) != NULL) {
-            handle_message(message);
-            dbus_message_unref(message);
+        if (monitor_active) {
+            if (!dbus_connection_read_write(connection, 10)) break;
+            DBusMessage *message;
+            while ((message = dbus_connection_pop_message(connection)) != NULL) {
+                handle_message(message, 0);
+                dbus_message_unref(message);
+            }
         }
+        if (!pump_input_connection()) break;
     }
 
 stopped:
+    close_input_connection();
     close_connection();
     atomic_store_explicit(&running, 0, memory_order_relaxed);
     enqueue_message("STOPPED");

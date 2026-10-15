@@ -41,6 +41,8 @@ namespace FcitxCjkInput {
             new GameplayKeyState(Stopwatch.Frequency / 4L);
         private static readonly ShortcutCommitGuard ShortcutCommits =
             new ShortcutCommitGuard();
+        private static readonly HashSet<uint> NativePressedKeys = new HashSet<uint>();
+        private static readonly HashSet<uint> NativeConsumedKeys = new HashSet<uint>();
 
         private static StreamWriter _log;
         private static IntPtr _nativeHandle;
@@ -48,8 +50,13 @@ namespace FcitxCjkInput {
         private static NativeStart _nativeStart;
         private static NativePoll _nativePoll;
         private static NativeStop _nativeStop;
+        private static NativeSetFocus _nativeSetFocus;
+        private static NativeProcessKey _nativeProcessKey;
         private static string _engine = "unknown";
         private static bool _nativeReady;
+        private static bool _nativeDirectInputAvailable;
+        private static bool? _nativeFocusState;
+        private static long _nativeFocusRetryAt;
         private static int _overlayFrame = -1;
         private static bool _nativeLoaded;
         private static int _mainThreadId;
@@ -64,6 +71,7 @@ namespace FcitxCjkInput {
         private static bool _logInitialized;
         private static bool _textFieldActive;
         private static bool _searchWidgetFocused;
+        private static IMECompositionMode _imeModeWithoutTextField = IMECompositionMode.Auto;
         private static int _quickSearchFocusFrame = -1;
         private static int _shuttingDown;
         private static long _lastLogFlush;
@@ -82,6 +90,13 @@ namespace FcitxCjkInput {
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void NativeStop();
 
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int NativeSetFocus(int focused);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int NativeProcessKey(uint keyval, uint keycode, uint state, int release,
+            uint time);
+
         [DllImport("libdl.so.2")]
         private static extern IntPtr dlopen(string fileName, int flags);
 
@@ -97,6 +112,7 @@ namespace FcitxCjkInput {
 
             try {
                 _mainThreadId = Thread.CurrentThread.ManagedThreadId;
+                _imeModeWithoutTextField = Input.imeCompositionMode;
                 EnsureLog();
                 WriteRuntimeHeader("INIT");
                 LoadNativeBridge();
@@ -221,8 +237,20 @@ namespace FcitxCjkInput {
             _nativeStart = LoadNativeFunction<NativeStart>("fcitx_bridge_start");
             _nativePoll = LoadNativeFunction<NativePoll>("fcitx_bridge_poll");
             _nativeStop = LoadNativeFunction<NativeStop>("fcitx_bridge_stop");
+            _nativeSetFocus = TryLoadNativeFunction<NativeSetFocus>("fcitx_bridge_set_focus");
+            _nativeProcessKey = TryLoadNativeFunction<NativeProcessKey>("fcitx_bridge_process_key");
+            _nativeDirectInputAvailable = _nativeSetFocus != null && _nativeProcessKey != null;
             _nativeLoaded = true;
             WriteLog("NATIVE loaded path=" + path);
+            if (!_nativeDirectInputAvailable)
+                WriteLog("NATIVE direct input exports missing; rebuild libfcitxcjkinput.so");
+        }
+
+        private static T TryLoadNativeFunction<T>(string name) where T : class {
+            var pointer = dlsym(_nativeHandle, name);
+            return pointer == IntPtr.Zero
+                ? null
+                : (T)(object)Marshal.GetDelegateForFunctionPointer(pointer, typeof(T));
         }
 
         private static T LoadNativeFunction<T>(string name) where T : class {
@@ -242,6 +270,9 @@ namespace FcitxCjkInput {
                 return;
             _restartAt = 0;
             _nativeReady = false;
+            _nativeFocusState = null;
+            NativePressedKeys.Clear();
+            NativeConsumedKeys.Clear();
             var result = _nativeStart((uint)Process.GetCurrentProcess().Id);
             WriteLog("NATIVE start result=" + result);
             if (result != 0)
@@ -290,11 +321,15 @@ namespace FcitxCjkInput {
                 WriteLog("RX " + line);
             if (line.StartsWith("READY:", StringComparison.Ordinal)) {
                 _nativeReady = true;
+                _nativeFocusState = null;
                 _restartAt = 0;
                 return;
             }
             if (line == "STOPPED") {
                 _nativeReady = false;
+                _nativeFocusState = null;
+                NativePressedKeys.Clear();
+                NativeConsumedKeys.Clear();
                 Engines.Clear();
                 Composition.Reset();
                 CommittedCharacters.Clear();
@@ -450,10 +485,15 @@ namespace FcitxCjkInput {
         }
 
         private static bool IsSearchWidgetFocused() {
+            if (_quickSearchFocusFrame >= 0 &&
+                Time.frameCount - _quickSearchFocusFrame <= 1)
+                return true;
+            // Find.WindowStack is backed by the active game and may not be
+            // available while Root.OnGUI is drawing the startup/menu screen.
+            if (Current.Game == null)
+                return false;
             var windowStack = Find.WindowStack;
-            return (_quickSearchFocusFrame >= 0 &&
-                Time.frameCount - _quickSearchFocusFrame <= 1) ||
-                (windowStack != null && windowStack.AnySearchWidgetFocused);
+            return windowStack != null && windowStack.AnySearchWidgetFocused;
         }
 
         private static void BeforeRootOnGui() {
@@ -480,6 +520,7 @@ namespace FcitxCjkInput {
                 _nativePollFrame = Time.frameCount;
                 DrainNativeMessages();
             }
+            UpdateNativeFocus(textFieldActive);
             SetImeCompositionMode(textFieldActive, "root");
 
             var currentEvent = Event.current;
@@ -495,7 +536,14 @@ namespace FcitxCjkInput {
             LogTextField("FIELD before-original", target, id, content, editor);
             if (target.Id == 0)
                 return;
+            UpdateNativeFocus(true);
+            var currentEvent = Event.current;
+            if (!IsSearchWidgetFocused())
+                ProcessNativeKeyEvent(currentEvent, "text-field");
             SuppressRawHangulKey(id);
+            if (!IsSearchWidgetFocused() && currentEvent != null &&
+                ProcessNativeTextCharacter(currentEvent, "text-field"))
+                currentEvent.Use();
             if (DebugLogging)
                 VerifyCommittedText(target, id, content, editor);
 
@@ -526,11 +574,6 @@ namespace FcitxCjkInput {
             var editor = (TextEditor)GUIUtility.GetStateObject(typeof(TextEditor), id);
             var target = ObserveEditor(id, editor);
             LogTextField("FIELD after-original", target, id, content, editor);
-            /*
-            if (Event.current.type == EventType.Repaint && GUIUtility.keyboardControl == id &&
-                Composition.TryGetView(target, out var view))
-                DrawPreedit(editor, view);
-            */
 
             if (Event.current.type == EventType.Repaint && DebugLogging && _overlayFrame != Time.frameCount) {
                 _overlayFrame = Time.frameCount;
@@ -544,6 +587,8 @@ namespace FcitxCjkInput {
                 _quickSearchFocusFrame = Time.frameCount;
                 _searchWidgetFocused = true;
                 _textFieldActive = true;
+                UpdateNativeFocus(true);
+                ProcessNativeKeyEvent(Event.current, "quick-search");
                 SetImeCompositionMode(true, "quick-search");
             }
         }
@@ -562,11 +607,23 @@ namespace FcitxCjkInput {
                 "] focused=" + focused + " " + DescribeEvent());
         }
 
-        private static void BeforeSearchTextSet(QuickSearchFilter __instance, string value) {
-            if (!DebugLogging)
-                return;
-            WriteLog("SEARCH set filter=" + RuntimeHelpers.GetHashCode(__instance) + " old=[" +
-                Escape(__instance.Text) + "] new=[" + Escape(value) + "] " + DescribeEvent());
+        private static void BeforeSearchTextSet(QuickSearchFilter __instance, ref string value) {
+            var previous = __instance.Text;
+            var currentEvent = Event.current;
+            var fallbackCharacter = currentEvent != null && currentEvent.character >= ' ' &&
+                currentEvent.character != '\u007f' &&
+                currentEvent.rawType != EventType.KeyDown &&
+                currentEvent.rawType != EventType.KeyUp;
+            if (_textFieldActive && fallbackCharacter &&
+                ProcessNativeTextCharacter(currentEvent, "quick-search")) {
+                value = previous;
+                if (DebugLogging)
+                    WriteLog("SEARCH suppress-native-char char=U+" +
+                        ((int)currentEvent.character).ToString("X4") + " " + DescribeEvent());
+            }
+            if (DebugLogging)
+                WriteLog("SEARCH set filter=" + RuntimeHelpers.GetHashCode(__instance) + " old=[" +
+                    Escape(previous) + "] new=[" + Escape(value) + "] " + DescribeEvent());
         }
 
         private static void AfterKeyBindingIsDown(KeyBindingDef __instance, ref bool __result) {
@@ -663,7 +720,7 @@ namespace FcitxCjkInput {
         }
 
         private static void SetImeCompositionMode(bool textFieldActive, string reason) {
-            var requested = textFieldActive ? IMECompositionMode.On : IMECompositionMode.Off;
+            var requested = textFieldActive ? IMECompositionMode.On : _imeModeWithoutTextField;
             var previous = Input.imeCompositionMode;
             if (previous == requested)
                 return;
@@ -673,6 +730,218 @@ namespace FcitxCjkInput {
                     reason + " keyboardControl=" + GUIUtility.keyboardControl +
                     " focusedControl=" + _focusedControl + " seenFrame=" +
                     _focusedTextFieldFrame + " frame=" + Time.frameCount);
+        }
+
+        private static void UpdateNativeFocus(bool focused) {
+            if (!_nativeDirectInputAvailable || !_nativeReady || _nativeSetFocus == null)
+                return;
+            var now = Stopwatch.GetTimestamp();
+            if (_nativeFocusState == focused || now < _nativeFocusRetryAt)
+                return;
+            var result = _nativeSetFocus(focused ? 1 : 0);
+            if (result == 0) {
+                _nativeFocusState = focused;
+                _nativeFocusRetryAt = 0;
+                if (DebugLogging)
+                    WriteLog("FCITX focus=" + focused);
+            } else {
+                _nativeFocusRetryAt = now + Stopwatch.Frequency;
+                if (DebugLogging)
+                    WriteLog("FCITX focus failed focused=" + focused + " result=" + result);
+            }
+        }
+
+        private static bool ProcessNativeKeyEvent(Event currentEvent, string source) {
+            if (!_nativeDirectInputAvailable || !_nativeReady || !_textFieldActive ||
+                currentEvent == null || _nativeProcessKey == null)
+                return false;
+            var rawType = currentEvent.rawType;
+            if (rawType != EventType.KeyDown && rawType != EventType.KeyUp)
+                return false;
+            if (!TryGetFcitxKey(currentEvent, out var keyval))
+                return false;
+
+            var keyName = currentEvent.keyCode.ToString();
+            var state = FcitxModifierState(currentEvent.modifiers);
+            var release = rawType == EventType.KeyUp;
+            if (!release) {
+                var accepted = SendNativeKey(keyval, state, release: false);
+                NativePressedKeys.Add(keyval);
+                if (accepted) {
+                    NativeConsumedKeys.Add(keyval);
+                    currentEvent.Use();
+                }
+                if (DebugLogging)
+                    WriteLog("FCITX key source=" + source + " key=" + keyName + " keysym=0x" +
+                        keyval.ToString("X") + " state=0x" + state.ToString("X") +
+                        " release=False accepted=" + accepted + " " + DescribeEvent());
+                return accepted;
+            }
+
+            var consumed = NativeConsumedKeys.Remove(keyval);
+            if (NativePressedKeys.Remove(keyval)) {
+                var accepted = SendNativeKey(keyval, state, release: true);
+                if (consumed)
+                    currentEvent.Use();
+                if (DebugLogging)
+                    WriteLog("FCITX key source=" + source + " key=" + keyName + " keysym=0x" +
+                        keyval.ToString("X") + " state=0x" + state.ToString("X") +
+                        " release=True accepted=" + accepted + " consumed=" + consumed + " " +
+                        DescribeEvent());
+                return consumed;
+            }
+
+            if ((currentEvent.modifiers & (EventModifiers.Control | EventModifiers.Alt |
+                    EventModifiers.Command)) == 0 && !IsModifierKeysym(keyval) &&
+                !IsNonTextKeysym(keyval))
+                return false;
+            var pressState = RemoveModifierSelfState(keyval, state);
+            var syntheticAccepted = SendNativeKey(keyval, pressState, release: false);
+            SendNativeKey(keyval, state, release: true);
+            if (syntheticAccepted)
+                currentEvent.Use();
+            if (DebugLogging)
+                WriteLog("FCITX key synthetic source=" + source + " key=" + keyName +
+                    " keysym=0x" + keyval.ToString("X") + " state=0x" +
+                    pressState.ToString("X") + " accepted=" + syntheticAccepted + " " +
+                    DescribeEvent());
+            return syntheticAccepted;
+        }
+
+        private static bool ProcessNativeTextCharacter(Event currentEvent, string source) {
+            if (!_nativeDirectInputAvailable || !_nativeReady || !_textFieldActive ||
+                currentEvent == null || _nativeProcessKey == null ||
+                currentEvent.character < ' ' || currentEvent.character == '\u007f' ||
+                currentEvent.character >= '\ud800' && currentEvent.character <= '\udfff')
+                return false;
+            if (currentEvent.rawType == EventType.KeyDown ||
+                currentEvent.rawType == EventType.KeyUp)
+                return false;
+            var keyval = UnicodeKeysym(currentEvent.character);
+            var state = FcitxModifierState(currentEvent.modifiers);
+            var accepted = SendNativeKey(keyval, state, release: false);
+            SendNativeKey(keyval, state, release: true);
+            if (DebugLogging)
+                WriteLog("FCITX character source=" + source + " char=U+" +
+                    ((int)currentEvent.character).ToString("X4") + " keysym=0x" +
+                    keyval.ToString("X") + " state=0x" + state.ToString("X") +
+                    " accepted=" + accepted + " " + DescribeEvent());
+            return accepted;
+        }
+
+        private static bool SendNativeKey(uint keyval, uint state, bool release) {
+            if (_nativeProcessKey == null)
+                return false;
+            var result = _nativeProcessKey(keyval, 0, state, release ? 1 : 0,
+                unchecked((uint)Environment.TickCount));
+            return result == 1;
+        }
+
+        private static bool TryGetFcitxKey(Event currentEvent, out uint keyval) {
+            var name = currentEvent.keyCode.ToString();
+            var character = currentEvent.character;
+            if (name == "None" &&
+                (currentEvent.modifiers & EventModifiers.Alt) != 0) {
+                keyval = 0xffea; // Waylith can expose a modifier-only RightAlt event.
+                return true;
+            }
+            if (name == "None" && character >= ' ' && character != '\u007f' &&
+                !(character >= '\ud800' && character <= '\udfff')) {
+                keyval = UnicodeKeysym(character);
+                return true;
+            }
+
+            if (name.Length == 1 && char.IsLetter(name[0])) {
+                keyval = char.ToLowerInvariant(name[0]);
+                return true;
+            }
+            if (name.StartsWith("Alpha", StringComparison.Ordinal) && name.Length == 6 &&
+                char.IsDigit(name[5])) {
+                keyval = (uint)name[5];
+                return true;
+            }
+            if (name.StartsWith("Keypad", StringComparison.Ordinal) && name.Length == 7 &&
+                char.IsDigit(name[6])) {
+                keyval = 0xffb0u + (uint)(name[6] - '0');
+                return true;
+            }
+
+            switch (name) {
+                case "Space": keyval = 0x20; return true;
+                case "Return": keyval = 0xff0d; return true;
+                case "KeypadEnter": keyval = 0xff8d; return true;
+                case "Tab": keyval = 0xff09; return true;
+                case "Backspace": keyval = 0xff08; return true;
+                case "Escape": keyval = 0xff1b; return true;
+                case "Delete": keyval = 0xffff; return true;
+                case "Insert": keyval = 0xff63; return true;
+                case "Home": keyval = 0xff50; return true;
+                case "End": keyval = 0xff57; return true;
+                case "PageUp": keyval = 0xff55; return true;
+                case "PageDown": keyval = 0xff56; return true;
+                case "LeftArrow": keyval = 0xff51; return true;
+                case "UpArrow": keyval = 0xff52; return true;
+                case "RightArrow": keyval = 0xff53; return true;
+                case "DownArrow": keyval = 0xff54; return true;
+                case "LeftShift": keyval = 0xffe1; return true;
+                case "RightShift": keyval = 0xffe2; return true;
+                case "LeftControl": keyval = 0xffe3; return true;
+                case "RightControl": keyval = 0xffe4; return true;
+                case "LeftAlt": keyval = 0xffe9; return true;
+                case "RightAlt": keyval = 0xffea; return true;
+                case "LeftCommand": keyval = 0xffeb; return true;
+                case "RightCommand": keyval = 0xffec; return true;
+            }
+            if (name.Length >= 2 && name[0] == 'F' &&
+                int.TryParse(name.Substring(1), out var functionKey) &&
+                functionKey >= 1 && functionKey <= 35) {
+                keyval = 0xffbeu + (uint)(functionKey - 1);
+                return true;
+            }
+            if (character >= ' ' && character != '\u007f' &&
+                !(character >= '\ud800' && character <= '\udfff')) {
+                keyval = UnicodeKeysym(character);
+                return true;
+            }
+            keyval = 0;
+            return false;
+        }
+
+        private static uint UnicodeKeysym(char character) {
+            return character <= 0xff ? character : 0x01000000u | character;
+        }
+
+        private static uint FcitxModifierState(EventModifiers modifiers) {
+            uint state = 0;
+            if ((modifiers & EventModifiers.Shift) != 0) state |= 1u << 0;
+            if ((modifiers & EventModifiers.CapsLock) != 0) state |= 1u << 1;
+            if ((modifiers & EventModifiers.Control) != 0) state |= 1u << 2;
+            if ((modifiers & EventModifiers.Alt) != 0) state |= 1u << 3;
+            if ((modifiers & EventModifiers.Command) != 0) state |= 1u << 6;
+            return state;
+        }
+
+        private static bool IsModifierKeysym(uint keyval) {
+            return keyval == 0xffe1 || keyval == 0xffe2 ||
+                keyval == 0xffe3 || keyval == 0xffe4 ||
+                keyval == 0xffe9 || keyval == 0xffea ||
+                keyval == 0xffeb || keyval == 0xffec;
+        }
+
+        private static bool IsNonTextKeysym(uint keyval) {
+            return keyval >= 0xff00;
+        }
+
+        private static uint RemoveModifierSelfState(uint keyval, uint state) {
+            if (keyval == 0xffe1 || keyval == 0xffe2)
+                return state & ~(1u << 0);
+            if (keyval == 0xffe3 || keyval == 0xffe4)
+                return state & ~(1u << 2);
+            if (keyval == 0xffe9 || keyval == 0xffea)
+                return state & ~((1u << 3) | (1u << 7));
+            if (keyval == 0xffeb || keyval == 0xffec)
+                return state & ~(1u << 6);
+            return state;
         }
 
         private static void LogRootEvent(Event currentEvent, bool textFieldActive) {
@@ -726,45 +995,33 @@ namespace FcitxCjkInput {
                     "] event=" + Event.current.type);
         }
 
-        /*
-        private static void DrawPreedit(TextEditor editor, CompositionView view) {
-            var originalText = editor.text;
-            var originalCursor = editor.cursorIndex;
-            var originalSelect = editor.selectIndex;
-            var selectionStart = Math.Max(0, Math.Min(view.SelectionStart, originalText.Length));
-            var selectionEnd = Math.Max(selectionStart, Math.Min(view.SelectionEnd, originalText.Length));
-            var displayText = TextEditMath.ReplaceRange(originalText, selectionStart, selectionEnd,
-                view.Text);
-            var displayCursor = selectionStart + Math.Min(view.Cursor, view.Text.Length);
-
-            if (DebugLogging)
-                WriteLog("DRAW preedit original=[" + Escape(originalText) + "] display=[" +
-                    Escape(displayText) + "] selection=" + selectionStart + ":" + selectionEnd +
-                    " displayCursor=" + displayCursor + " " + DescribeEvent());
-            try {
-                editor.text = displayText;
-                editor.cursorIndex = displayCursor;
-                editor.selectIndex = displayCursor;
-                editor.DrawCursor(displayText);
-            } finally {
-                editor.text = originalText;
-                editor.cursorIndex = originalCursor;
-                editor.selectIndex = originalSelect;
-                if (DebugLogging)
-                    WriteLog("DRAW restore editor=[" + Escape(editor.text) + "] cursor=" +
-                        editor.cursorIndex + " select=" + editor.selectIndex + " " +
-                        DescribeEvent());
-            }
-        }
-        */
-
         private static void BeforeDrawTextAreaContent(ref string text, ref int caret, ref int selA, ref int selB, ref int compA, ref int compB) {
+            var currentEvent = Event.current;
+            var logEvent = currentEvent != null &&
+                (currentEvent.rawType == EventType.KeyDown ||
+                    currentEvent.rawType == EventType.KeyUp ||
+                    (currentEvent.type == EventType.Used && currentEvent.character != '\0'));
             var id = GUIUtility.keyboardControl;
-            if (id == 0 ||
-                !ControlTokens.TryGetValue(id, out var target) ||
-                !Composition.TryGetView(target, out var view)) {
+            if (id == 0) {
+                if (DebugLogging && logEvent)
+                    WriteLog("DRAW hook skip=no-keyboard-control " + DescribeEvent());
                 return;
             }
+            if (!ControlTokens.TryGetValue(id, out var target)) {
+                if (DebugLogging && logEvent)
+                    WriteLog("DRAW hook skip=no-control-token control=" + id + " " + DescribeEvent());
+                return;
+            }
+            if (!Composition.TryGetView(target, out var view)) {
+                if (DebugLogging && logEvent)
+                    WriteLog("DRAW hook skip=no-preedit control=" + id + " token=" +
+                        target.Id + ":" + target.Generation + " " + DescribeEvent());
+                return;
+            }
+
+            if (DebugLogging && logEvent)
+                WriteLog("DRAW hook apply control=" + id + " token=" + target.Id + ":" +
+                    target.Generation + " preedit=[" + Escape(view.Text) + "] " + DescribeEvent());
 
             var originalText = text ?? "";
             var selectionStart = Math.Max(0, Math.Min(view.SelectionStart, originalText.Length));
@@ -772,7 +1029,8 @@ namespace FcitxCjkInput {
 
             text = TextEditMath.ReplaceRange(originalText, selectionStart, selectionEnd, view.Text);
 
-            caret = selectionStart + Math.Max(0, Math.Min(view.SelectionEnd, originalText.Length));
+            var preeditCursor = Math.Max(0, Math.Min(view.Cursor, view.Text.Length));
+            caret = selectionStart + preeditCursor;
 
             selA = caret;
             selB = caret;
