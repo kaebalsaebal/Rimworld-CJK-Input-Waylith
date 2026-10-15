@@ -271,12 +271,14 @@ namespace FcitxCjkInput {
             harmony.Patch(playSettingsControls,
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod),
                     nameof(AfterPlaySettingsControls)));
+            /*
             WriteLog("PATCH Root.OnGUI=" + rootOnGui + " textField=" + desktopTextField +
                 " textFieldImpl=" + textFieldImpl +
                 " waylithInputKey=" + (waylithOnKey?.ToString() ?? "unavailable") +
                 " quickSearch=" + quickSearch + " searchTextSetter=" + searchTextSetter +
                 " keyBindingIsDown=" + keyBindingIsDown + " keyBindingKeyDownEvent=" +
                 keyBindingKeyDownEvent + " playSettingsControls=" + playSettingsControls);
+            */
         }
 
         private static void LoadNativeBridge() {
