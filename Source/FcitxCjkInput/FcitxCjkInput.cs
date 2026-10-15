@@ -64,7 +64,7 @@ namespace FcitxCjkInput {
         private static int _nativePollFrame = -1;
         private static long _restartAt;
         private static int _focusedControl;
-        private static int _desktopTextFieldDepth;
+        private static int _desktopTextFieldHandledDepth;
         private static int _focusedTextFieldFrame = -10;
         private static int _lastZContext;
         private static int _unboundPreeditContext;
@@ -80,6 +80,8 @@ namespace FcitxCjkInput {
         private static bool _settingQuickSearchText;
         private static bool _quickSearchCaretSyncPending;
         private static int _quickSearchPendingCaret = -1;
+        private static bool _suppressRightAltKeyUp;
+        private static bool _consumeSuppressedRightAltKeyUp;
         private static IMECompositionMode _imeModeWithoutTextField = IMECompositionMode.Auto;
         private static int _quickSearchFocusFrame = -1;
         private static int _shuttingDown;
@@ -553,10 +555,19 @@ namespace FcitxCjkInput {
         }
 
         private static void BeforeDesktopTextField(Rect position, int id, GUIContent content,
-            bool multiline, int maxLength, GUIStyle style) {
-            _desktopTextFieldDepth++;
-            if (GUIUtility.keyboardControl != id)
+            bool multiline, int maxLength, GUIStyle style, out bool __state) {
+            __state = id != 0 && GUIUtility.keyboardControl == id;
+            if (!__state) {
+                var focusEvent = Event.current;
+                if (DebugLogging && focusEvent != null &&
+                    (focusEvent.rawType == EventType.KeyDown ||
+                        focusEvent.rawType == EventType.KeyUp))
+                    WriteLog("FIELD skip=not-focused id=" + id + " keyboardControl=" +
+                        GUIUtility.keyboardControl + " multiline=" + multiline + " " +
+                        DescribeEvent());
                 return;
+            }
+            _desktopTextFieldHandledDepth++;
 
             var editor = (TextEditor)GUIUtility.GetStateObject(typeof(TextEditor), id);
             var target = ObserveEditor(id, editor);
@@ -597,8 +608,10 @@ namespace FcitxCjkInput {
         }
 
         private static void AfterDesktopTextField(Rect position, int id, GUIContent content,
-            bool multiline, int maxLength, GUIStyle style) {
-            _desktopTextFieldDepth = Math.Max(0, _desktopTextFieldDepth - 1);
+            bool multiline, int maxLength, GUIStyle style, bool __state) {
+            if (__state)
+                _desktopTextFieldHandledDepth = Math.Max(0,
+                    _desktopTextFieldHandledDepth - 1);
             if (GUIUtility.keyboardControl != id)
                 return;
 
@@ -610,7 +623,7 @@ namespace FcitxCjkInput {
 
         private static void BeforeTextFieldImpl(Rect rect, ref string text, GUIStyle style,
             bool multiline) {
-            if (_desktopTextFieldDepth > 0 || IsSearchWidgetFocused() ||
+            if (_desktopTextFieldHandledDepth > 0 || IsSearchWidgetFocused() ||
                 !TryGetFocusedTextEditor(rect, out var id, out var editor))
                 return;
 
@@ -656,7 +669,7 @@ namespace FcitxCjkInput {
 
         private static void AfterTextFieldImpl(Rect rect, string text, GUIStyle style,
             bool multiline, string __result) {
-            if (_desktopTextFieldDepth > 0 || IsSearchWidgetFocused() ||
+            if (_desktopTextFieldHandledDepth > 0 || IsSearchWidgetFocused() ||
                 !TryGetFocusedTextEditor(rect, out var id, out var editor))
                 return;
 
@@ -1009,14 +1022,52 @@ namespace FcitxCjkInput {
             var rawType = currentEvent.rawType;
             if (rawType != EventType.KeyDown && rawType != EventType.KeyUp)
                 return false;
+            var release = rawType == EventType.KeyUp;
+            if (release && _suppressRightAltKeyUp &&
+                (currentEvent.keyCode == KeyCode.RightAlt ||
+                    (currentEvent.keyCode == KeyCode.None && currentEvent.character == '\0'))) {
+                var consume = _consumeSuppressedRightAltKeyUp;
+                _suppressRightAltKeyUp = false;
+                _consumeSuppressedRightAltKeyUp = false;
+                if (consume)
+                    currentEvent.Use();
+                if (DebugLogging)
+                    WriteLog("FCITX key source=" + source +
+                        " key=RightAlt release=True synthetic-tap-followup=suppressed " +
+                        " consumed=" + consume + " " +
+                        DescribeEvent());
+                return consume;
+            }
             if (!TryGetFcitxKey(currentEvent, out var keyval))
                 return false;
 
+            if (!release && keyval == 0xffea) {
+                _suppressRightAltKeyUp = false;
+                _consumeSuppressedRightAltKeyUp = false;
+            }
             var keyName = currentEvent.keyCode.ToString();
             var state = FcitxModifierState(currentEvent.modifiers);
-            var release = rawType == EventType.KeyUp;
             if (!release) {
-                var accepted = SendNativeKey(keyval, state, release: false);
+                var keyDownState = RemoveModifierSelfState(keyval, state);
+                if (keyval == 0xffea &&
+                    (keyDownState & ((1u << 0) | (1u << 2) | (1u << 3) | (1u << 6))) == 0) {
+                    // Waylith may omit RightAlt KeyUp, so send the configured one-key trigger
+                    // as a complete press/release pair and suppress its late physical release.
+                    var acceptedPress = SendNativeKey(keyval, keyDownState, release: false);
+                    var acceptedRelease = SendNativeKey(keyval, keyDownState, release: true);
+                    _suppressRightAltKeyUp = true;
+                    _consumeSuppressedRightAltKeyUp = acceptedPress || acceptedRelease;
+                    if (acceptedPress || acceptedRelease)
+                        currentEvent.Use();
+                    if (DebugLogging)
+                        WriteLog("FCITX key source=" + source + " key=RightAlt keysym=0x" +
+                            keyval.ToString("X") + " state=0x" + keyDownState.ToString("X") +
+                            " release=False synthetic-tap=True acceptedPress=" + acceptedPress +
+                            " acceptedRelease=" + acceptedRelease + " " + DescribeEvent());
+                    return acceptedPress || acceptedRelease;
+                }
+
+                var accepted = SendNativeKey(keyval, keyDownState, release: false);
                 NativePressedKeys.Add(keyval);
                 if (accepted) {
                     NativeConsumedKeys.Add(keyval);
@@ -1024,7 +1075,8 @@ namespace FcitxCjkInput {
                 }
                 if (DebugLogging)
                     WriteLog("FCITX key source=" + source + " key=" + keyName + " keysym=0x" +
-                        keyval.ToString("X") + " state=0x" + state.ToString("X") +
+                        keyval.ToString("X") + " state=0x" + keyDownState.ToString("X") +
+                        " rawState=0x" + state.ToString("X") +
                         " release=False accepted=" + accepted + " " + DescribeEvent());
                 return accepted;
             }
