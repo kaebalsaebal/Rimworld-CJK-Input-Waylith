@@ -71,6 +71,11 @@ namespace FcitxCjkInput {
         private static bool _logInitialized;
         private static bool _textFieldActive;
         private static bool _searchWidgetFocused;
+        private static QuickSearchFilter _quickSearchFilter;
+        private static ControlToken _quickSearchTarget;
+        private static string _quickSearchCommittedText = "";
+        private static string _quickSearchRenderedText = "";
+        private static bool _settingQuickSearchText;
         private static IMECompositionMode _imeModeWithoutTextField = IMECompositionMode.Auto;
         private static int _quickSearchFocusFrame = -1;
         private static int _shuttingDown;
@@ -582,21 +587,33 @@ namespace FcitxCjkInput {
         }
 
         private static void BeforeQuickSearch(QuickSearchWidget __instance, out string __state) {
-            __state = __instance.filter.Text;
+            var filter = __instance.filter;
+            __state = filter.Text;
             if (__instance.CurrentlyFocused()) {
                 _quickSearchFocusFrame = Time.frameCount;
                 _searchWidgetFocused = true;
                 _textFieldActive = true;
+                BeginOrRefreshQuickSearchTarget(filter);
+                Composition.Focus(_quickSearchTarget, _quickSearchCommittedText.Length,
+                    _quickSearchCommittedText.Length);
                 UpdateNativeFocus(true);
                 ProcessNativeKeyEvent(Event.current, "quick-search");
                 SetImeCompositionMode(true, "quick-search");
+                ApplyQuickSearchComposition();
             }
         }
 
         private static void AfterQuickSearch(QuickSearchWidget __instance, string __state) {
+            var focused = __instance.CurrentlyFocused();
+            if (!focused && ReferenceEquals(_quickSearchFilter, __instance.filter)) {
+                SetQuickSearchText(_quickSearchFilter, _quickSearchCommittedText);
+                _quickSearchFilter = null;
+                _quickSearchTarget = default;
+                _quickSearchRenderedText = "";
+                Composition.Blur();
+            }
             if (!DebugLogging)
                 return;
-            var focused = __instance.CurrentlyFocused();
             var currentEvent = Event.current;
             var keyEvent = currentEvent != null && (currentEvent.rawType == EventType.KeyDown ||
                 currentEvent.rawType == EventType.KeyUp);
@@ -609,6 +626,9 @@ namespace FcitxCjkInput {
 
         private static void BeforeSearchTextSet(QuickSearchFilter __instance, ref string value) {
             var previous = __instance.Text;
+            if (_settingQuickSearchText)
+                return;
+
             var currentEvent = Event.current;
             var fallbackCharacter = currentEvent != null && currentEvent.character >= ' ' &&
                 currentEvent.character != '\u007f' &&
@@ -621,9 +641,88 @@ namespace FcitxCjkInput {
                     WriteLog("SEARCH suppress-native-char char=U+" +
                         ((int)currentEvent.character).ToString("X4") + " " + DescribeEvent());
             }
+
+            if (ReferenceEquals(__instance, _quickSearchFilter) &&
+                value != _quickSearchRenderedText) {
+                _quickSearchCommittedText = value ?? "";
+                _quickSearchRenderedText = _quickSearchCommittedText;
+                if (Composition.ActiveContext != 0)
+                    Composition.CancelComposition(Composition.ActiveContext);
+            }
             if (DebugLogging)
                 WriteLog("SEARCH set filter=" + RuntimeHelpers.GetHashCode(__instance) + " old=[" +
                     Escape(previous) + "] new=[" + Escape(value) + "] " + DescribeEvent());
+        }
+
+        private static void BeginOrRefreshQuickSearchTarget(QuickSearchFilter filter) {
+            if (!ReferenceEquals(filter, _quickSearchFilter)) {
+                _quickSearchFilter = filter;
+                _quickSearchTarget = new ControlToken(int.MinValue, ++_focusGeneration);
+                _quickSearchCommittedText = filter.Text ?? "";
+                _quickSearchRenderedText = _quickSearchCommittedText;
+                if (DebugLogging)
+                    WriteLog("STATE quick-search focus filter=" +
+                        RuntimeHelpers.GetHashCode(filter) + " token=" + _quickSearchTarget.Id +
+                        ":" + _quickSearchTarget.Generation + " text=[" +
+                        Escape(_quickSearchCommittedText) + "]");
+                return;
+            }
+
+            var currentText = filter.Text ?? "";
+            if (currentText != _quickSearchRenderedText && !_settingQuickSearchText) {
+                _quickSearchCommittedText = currentText;
+                _quickSearchRenderedText = currentText;
+            }
+        }
+
+        private static void ApplyQuickSearchComposition() {
+            if (_quickSearchFilter == null || _quickSearchTarget.Id == 0)
+                return;
+
+            var actions = Composition.TakeActions(_quickSearchTarget, Stopwatch.GetTimestamp());
+            foreach (var action in actions) {
+                var start = Math.Max(0, Math.Min(action.SelectionStart,
+                    _quickSearchCommittedText.Length));
+                var end = Math.Max(start, Math.Min(action.SelectionEnd,
+                    _quickSearchCommittedText.Length));
+                _quickSearchCommittedText = TextEditMath.ReplaceRange(_quickSearchCommittedText,
+                    start, end, action.Text);
+                if (DebugLogging)
+                    WriteLog("SEARCH commit token=" + action.Target.Id + ":" +
+                        action.Target.Generation + " text=[" + Escape(action.Text) +
+                        "] result=[" + Escape(_quickSearchCommittedText) + "]");
+            }
+
+            var renderedText = _quickSearchCommittedText;
+            if (Composition.TryGetView(_quickSearchTarget, out var view)) {
+                var start = Math.Max(0, Math.Min(view.SelectionStart,
+                    _quickSearchCommittedText.Length));
+                var end = Math.Max(start, Math.Min(view.SelectionEnd,
+                    _quickSearchCommittedText.Length));
+                renderedText = TextEditMath.ReplaceRange(_quickSearchCommittedText, start, end,
+                    view.Text);
+            }
+            if (renderedText == _quickSearchFilter.Text)
+                return;
+
+            SetQuickSearchText(_quickSearchFilter, renderedText);
+            if (DebugLogging)
+                WriteLog("SEARCH composition display=[" + Escape(renderedText) + "] committed=[" +
+                    Escape(_quickSearchCommittedText) + "] preedit=" +
+                    Composition.TryGetView(_quickSearchTarget, out _) + " " + DescribeEvent());
+        }
+
+        private static void SetQuickSearchText(QuickSearchFilter filter, string text) {
+            if (filter == null)
+                return;
+            _settingQuickSearchText = true;
+            try {
+                filter.Text = text ?? "";
+                _quickSearchRenderedText = filter.Text ?? "";
+                GUI.changed = true;
+            } finally {
+                _settingQuickSearchText = false;
+            }
         }
 
         private static void AfterKeyBindingIsDown(KeyBindingDef __instance, ref bool __result) {
