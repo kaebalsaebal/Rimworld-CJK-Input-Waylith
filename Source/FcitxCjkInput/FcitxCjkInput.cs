@@ -233,7 +233,7 @@ namespace FcitxCjkInput {
 
             var waylithInputState = AccessTools.TypeByName("Waylith.Input.InputState");
             var waylithOnKey = waylithInputState?.GetMethods(
-                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
                 .FirstOrDefault(method => {
                     if (method.Name != "OnKey")
                         return false;
@@ -246,10 +246,6 @@ namespace FcitxCjkInput {
                 _waylithCtrlDown = AccessTools.PropertyGetter(waylithInputState, "CtrlDown");
                 _waylithAltDown = AccessTools.PropertyGetter(waylithInputState, "AltDown");
                 _waylithMetaDown = AccessTools.PropertyGetter(waylithInputState, "MetaDown");
-                WriteLog("WAYLITH getters ShiftDown=" + (_waylithShiftDown != null) +
-                " CtrlDown=" + (_waylithCtrlDown != null) +
-                " AltDown=" + (_waylithAltDown != null) +
-                " MetaDown=" + (_waylithMetaDown != null));
             harmony.Patch(waylithOnKey,
                     prefix: new HarmonyMethod(typeof(FcitxCjkInputMod),
                         nameof(BeforeWaylithInputKey)));
