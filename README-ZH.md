@@ -47,7 +47,7 @@ XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
 
 Unity 2022 会创建 SDL2 fcitx5 输入上下文，但不会把 Linux IME 的提交内容连接到 IMGUI 文本框。本 mod 会做以下事情：
 
-1. 将 `1.6/Assemblies/libfcitxcjkinput.so` 加载进 RimWorld 进程。
+1. 将 `1.7/Assemblies/libfcitxcjkinput.so` 加载进 RimWorld 进程。
 2. 监听 RimWorld 的 SDL2 输入上下文对应的 fcitx5 D-Bus 调用、响应与信号。
 3. 在 Unity 主线程的 IMGUI 处理过程中排空原生事件队列。
 4. 追踪每个输入上下文、事件序列、目标控件与输入法组合锚点。
@@ -70,8 +70,8 @@ just install
 `just build` 会生成以下文件：
 
 ```text
-1.6/Assemblies/FcitxCjkInput.dll
-1.6/Assemblies/libfcitxcjkinput.so
+1.7/Assemblies/FcitxCjkInput.dll
+1.7/Assemblies/libfcitxcjkinput.so
 ```
 
 原生库动态链接系统自带的 `libdbus-1.so.3`。

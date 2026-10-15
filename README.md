@@ -17,7 +17,7 @@
 ```sh
 sudo apt install libdbus-1-3    # Ubuntu
 sudo apt install libdbus-1-3    # Debian
-sudo dnf install dbus-libs      # Fedora
+sudo dnf install dbus-libs      # Fedora / Rocky Linux (runtime)
 sudo pacman -S dbus             # Arch
 sudo apk add dbus-libs          # Alpine
 sudo zypper install libdbus-1-3 # openSUSE
@@ -54,7 +54,7 @@ XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
 
 Unity 2022는 SDL2 fcitx5 입력 컨텍스트를 생성하지만 Linux IME 커밋을 IMGUI 텍스트 필드에 연결하지 않습니다. 이 모드는 다음 작업을 수행합니다.
 
-1. RimWorld 프로세스에 `1.6/Assemblies/libfcitxcjkinput.so`를 로드합니다.
+1. RimWorld 프로세스에 `1.7/Assemblies/libfcitxcjkinput.so`를 로드합니다.
 2. RimWorld의 SDL2 입력 컨텍스트에 대한 fcitx5 D-Bus 호출, 응답 및 시그널을 관찰합니다.
 3. Unity 메인 스레드의 IMGUI 처리 과정에서 네이티브 이벤트 큐를 비웁니다.
 4. 각 입력 컨텍스트, 이벤트 시퀀스, 대상 컨트롤 및 조합 앵커를 추적합니다.
@@ -67,6 +67,15 @@ Unity 2022는 SDL2 fcitx5 입력 컨텍스트를 생성하지만 Linux IME 커�
 
 ### 빌드 및 설치
 
+Rocky Linux 9에서 네이티브 `.so`를 빌드할 때는 x86_64 빌드 서버에서 개발 패키지를 설치한 뒤 실행합니다.
+
+```sh
+sudo dnf install gcc pkgconf-pkg-config dbus-devel
+just build-native
+```
+
+`just build-native`는 `CC`와 `PKG_CONFIG` 환경 변수를 지원합니다. 기본값은 `gcc`와 `pkg-config`입니다.
+
 ```sh
 just fmt
 just test
@@ -77,8 +86,8 @@ just install
 `just build`는 다음 파일을 생성합니다.
 
 ```text
-1.6/Assemblies/FcitxCjkInput.dll
-1.6/Assemblies/libfcitxcjkinput.so
+1.7/Assemblies/FcitxCjkInput.dll
+1.7/Assemblies/libfcitxcjkinput.so
 ```
 
 네이티브 라이브러리는 시스템의 `libdbus-1.so.3`에 동적으로 연결됩니다.
@@ -117,7 +126,7 @@ XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
 
 Unity 2022 creates an SDL2 fcitx5 input context but does not connect its Linux IME commits to IMGUI text fields. This mod:
 
-1. loads `1.6/Assemblies/libfcitxcjkinput.so` into the RimWorld process
+1. loads `1.7/Assemblies/libfcitxcjkinput.so` into the RimWorld process
 2. observes fcitx5 D-Bus calls, replies, and signals for RimWorld's SDL2 input contexts
 3. drains the native event queue from Unity's main-thread IMGUI pass
 4. tracks each input context, event sequence, target control, and composition anchor
@@ -130,6 +139,15 @@ enabling **Debug log** under **Options → Mod settings → Fcitx CJK Input** wi
 
 ## Build and install
 
+To build the native `.so` on Rocky Linux 9, use an x86_64 build server and install its development packages:
+
+```sh
+sudo dnf install gcc pkgconf-pkg-config dbus-devel
+just build-native
+```
+
+`just build-native` honors the `CC` and `PKG_CONFIG` environment variables; the defaults are `gcc` and `pkg-config`.
+
 ```sh
 just fmt
 just test
@@ -140,8 +158,8 @@ just install
 `just build` produces:
 
 ```text
-1.6/Assemblies/FcitxCjkInput.dll
-1.6/Assemblies/libfcitxcjkinput.so
+1.7/Assemblies/FcitxCjkInput.dll
+1.7/Assemblies/libfcitxcjkinput.so
 ```
 
 The native library is dynamically linked to the system `libdbus-1.so.3`.

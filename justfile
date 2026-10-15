@@ -7,6 +7,8 @@ mod_dest := rimworld + "/Mods/" + mod_name
 native_src := "native/fcitxcjkinput.c"
 native_test := "native/fcitxcjkinput_test.c"
 native_bin := "1.7/Assemblies/libfcitxcjkinput.so"
+native_cc := env_var_or_default("CC", "gcc")
+native_pkg_config := env_var_or_default("PKG_CONFIG", "pkg-config")
 
 # Download Harmony
 prepare:
@@ -15,9 +17,14 @@ prepare:
 
 # Build the in-process native bridge
 build-native:
+    @command -v {{native_cc}} >/dev/null || { echo "C compiler not found; install gcc or set CC."; exit 1; }
+    @command -v {{native_pkg_config}} >/dev/null || { echo "pkg-config not found; install pkgconf-pkg-config."; exit 1; }
+    @{{native_pkg_config}} --exists dbus-1 || { echo "D-Bus development files missing; install dbus-devel."; exit 1; }
     mkdir -p "$(dirname {{native_bin}})"
-    gcc -shared -fPIC -fvisibility=hidden -pthread -Wl,-soname,libfcitxcjkinput.so \
-        -o {{native_bin}} {{native_src}} $(pkg-config --cflags --libs dbus-1) -Wall -Wextra -O2
+    {{native_cc}} -std=gnu11 -shared -fPIC -fvisibility=hidden -pthread \
+        -Wl,-soname,libfcitxcjkinput.so \
+        -o {{native_bin}} {{native_src}} $({{native_pkg_config}} --cflags --libs dbus-1) \
+        -Wall -Wextra -O2
     @echo "Native bridge built: {{native_bin}}"
 
 # Format C# source
@@ -28,7 +35,8 @@ fmt:
 # Test native directional-key events
 test-native:
     output="$(mktemp /tmp/fcitxcjkinput-test.XXXXXX)"; trap 'rm -f "$output"' 0; \
-        gcc -o "$output" {{native_test}} $(pkg-config --cflags --libs dbus-1) \
+        {{native_cc}} -std=gnu11 -o "$output" {{native_test}} \
+        $({{native_pkg_config}} --cflags --libs dbus-1) \
         -pthread -Wall -Wextra -Werror; "$output"
 
 # Build the C# mod
