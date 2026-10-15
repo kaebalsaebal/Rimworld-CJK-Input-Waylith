@@ -235,6 +235,7 @@ namespace FcitxCjkInput {
             var waylithOnKey = waylithInputState?.GetMethods(
                     BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
                 .FirstOrDefault(method => {
+                    WriteLog("WAYLITHONKEY DEBUG: " + method.Name);
                     if (method.Name != "OnKey")
                         return false;
                     var parameters = method.GetParameters();
@@ -271,14 +272,14 @@ namespace FcitxCjkInput {
             harmony.Patch(playSettingsControls,
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod),
                     nameof(AfterPlaySettingsControls)));
-            /*
+            
             WriteLog("PATCH Root.OnGUI=" + rootOnGui + " textField=" + desktopTextField +
                 " textFieldImpl=" + textFieldImpl +
                 " waylithInputKey=" + (waylithOnKey?.ToString() ?? "unavailable") +
                 " quickSearch=" + quickSearch + " searchTextSetter=" + searchTextSetter +
                 " keyBindingIsDown=" + keyBindingIsDown + " keyBindingKeyDownEvent=" +
                 keyBindingKeyDownEvent + " playSettingsControls=" + playSettingsControls);
-            */
+            
         }
 
         private static void LoadNativeBridge() {
@@ -597,21 +598,6 @@ namespace FcitxCjkInput {
         }
 
         private static bool BeforeWaylithInputKey(object __instance, object[] __args) {
-            var keyArgument = __args != null && __args.Length > 0
-                ? __args[0]?.ToString() ?? "<null>"
-                : "<missing>";
-            var downArgument = __args != null && __args.Length > 1
-                ? __args[1]?.ToString() ?? "<null>"
-                : "<missing>";
-            if (DebugLogging)
-                WriteLog("FCITX waylith-onkey key=" + keyArgument + " down=" + downArgument +
-                    " instance=" + (__instance?.GetType().FullName ?? "<null>") +
-                    " InputState[shift=" + DescribeWaylithProperty(__instance, _waylithShiftDown) +
-                    " ctrl=" + DescribeWaylithProperty(__instance, _waylithCtrlDown) +
-                    " alt=" + DescribeWaylithProperty(__instance, _waylithAltDown) +
-                    " meta=" + DescribeWaylithProperty(__instance, _waylithMetaDown) + "] " +
-                    DescribeEvent());
-
             if (__args == null || __args.Length < 2 || __args[0] == null ||
                 !(__args[1] is bool down))
                 return true;
@@ -705,18 +691,6 @@ namespace FcitxCjkInput {
                 }
             }
             return Event.current != null && (Event.current.modifiers & fallback) != 0;
-        }
-
-        private static string DescribeWaylithProperty(object inputState, MethodInfo getter) {
-            if (inputState == null)
-                return "<no-instance>";
-            if (getter == null)
-                return "<missing>";
-            try {
-                return getter.Invoke(inputState, null)?.ToString() ?? "<null>";
-            } catch (Exception exception) {
-                return "<error:" + exception.GetType().Name + ">";
-            }
         }
 
         private static void BeforeDesktopTextField(Rect position, int id, GUIContent content,
