@@ -59,7 +59,6 @@ namespace FcitxCjkInput {
         private static bool _nativeDirectInputAvailable;
         private static bool? _nativeFocusState;
         private static long _nativeFocusRetryAt;
-        private static int _overlayFrame = -1;
         private static bool _nativeLoaded;
         private static int _mainThreadId;
         private static int _nativePollFrame = -1;
@@ -471,7 +470,8 @@ namespace FcitxCjkInput {
                     return;
                 }
                 Engines.TryGetValue(contextId, out var engine);
-                if (ImeRouting.IsImeEngine(engine) && ContainsNonAscii(text) &&
+                if (ImeRouting.IsImeEngine(engine) &&
+                    (engine == "hangul" || ContainsNonAscii(text)) && text.Length > 0 &&
                     Composition.Commit(contextId, sequence, text, now)) {
                     if (DebugLogging)
                         WriteLog("QUEUE commit context=" + contextId + " sequence=" + sequence +
@@ -599,11 +599,6 @@ namespace FcitxCjkInput {
         private static void AfterDesktopTextField(Rect position, int id, GUIContent content,
             bool multiline, int maxLength, GUIStyle style) {
             _desktopTextFieldDepth = Math.Max(0, _desktopTextFieldDepth - 1);
-            if (Event.current != null && Event.current.type == EventType.Repaint &&
-                DebugLogging && _overlayFrame != Time.frameCount) {
-                _overlayFrame = Time.frameCount;
-                DrawOverlay();
-            }
             if (GUIUtility.keyboardControl != id)
                 return;
 
@@ -1340,22 +1335,6 @@ namespace FcitxCjkInput {
                         insertedLength)));
             }
             return insertedLength;
-        }
-
-        private static void DrawOverlay() {
-            var style = new GUIStyle(GUI.skin.label) {
-                fontSize = 13,
-                normal = { textColor = _engine == "hangul" ? Color.green : Color.yellow }
-            };
-            var preedit = "";
-            if (ControlTokens.TryGetValue(_focusedControl, out var target) &&
-                Composition.TryGetView(target, out var view))
-                preedit = view.Text;
-            var text = "[CJK] engine=" + _engine + " native=" + (_nativeReady ? "ready" : "waiting") +
-                " debug=" + (DebugLogging ? "on" : "off") + " focus=" +
-                GUIUtility.keyboardControl + " preedit=[" + Escape(preedit) +
-                "] context=" + Composition.ActiveContext + " commits=" + Composition.PendingCount;
-            GUI.Label(new Rect(10f, 10f, 900f, 48f), text, style);
         }
 
         private static bool IsHangulLetter(KeyCode keyCode) {
