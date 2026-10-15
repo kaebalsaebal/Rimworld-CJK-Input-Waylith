@@ -64,6 +64,7 @@ namespace FcitxCjkInput {
         private static bool _logInitialized;
         private static bool _textFieldActive;
         private static bool _searchWidgetFocused;
+        private static int _quickSearchFocusFrame = -1;
         private static int _shuttingDown;
         private static long _lastLogFlush;
 
@@ -364,8 +365,7 @@ namespace FcitxCjkInput {
                 SetHangulEngine(contextId);
                 if (!release && (keyValue == 'z' || keyValue == 'Z'))
                     _lastZContext = contextId;
-                var gameplayBlocked = _textFieldActive ||
-                    Find.WindowStack.AnySearchWidgetFocused;
+                var gameplayBlocked = _textFieldActive || IsSearchWidgetFocused();
                 if (release || !gameplayBlocked)
                     GameplayKeys.Update(keyValue, release, observedAt, now);
                 return;
@@ -449,6 +449,13 @@ namespace FcitxCjkInput {
             _engine = engine;
         }
 
+        private static bool IsSearchWidgetFocused() {
+            var windowStack = Find.WindowStack;
+            return (_quickSearchFocusFrame >= 0 &&
+                Time.frameCount - _quickSearchFocusFrame <= 1) ||
+                (windowStack != null && windowStack.AnySearchWidgetFocused);
+        }
+
         private static void BeforeRootOnGui() {
             var now = Stopwatch.GetTimestamp();
             if (_restartAt != 0 && now >= _restartAt)
@@ -459,7 +466,7 @@ namespace FcitxCjkInput {
                 _focusedControl = 0;
                 Composition.Blur();
             }
-            var searchWidgetFocused = Find.WindowStack.AnySearchWidgetFocused;
+            var searchWidgetFocused = IsSearchWidgetFocused();
             if (searchWidgetFocused != _searchWidgetFocused) {
                 _searchWidgetFocused = searchWidgetFocused;
                 if (DebugLogging)
@@ -534,6 +541,7 @@ namespace FcitxCjkInput {
         private static void BeforeQuickSearch(QuickSearchWidget __instance, out string __state) {
             __state = __instance.filter.Text;
             if (__instance.CurrentlyFocused()) {
+                _quickSearchFocusFrame = Time.frameCount;
                 _searchWidgetFocused = true;
                 _textFieldActive = true;
                 SetImeCompositionMode(true, "quick-search");
@@ -600,7 +608,7 @@ namespace FcitxCjkInput {
         }
 
         private static bool TryRecoverKeyBinding(KeyBindingDef bindingDef, bool pressed) {
-            if (_textFieldActive || Find.WindowStack.AnySearchWidgetFocused)
+            if (_textFieldActive || IsSearchWidgetFocused())
                 return false;
             var preferences = KeyPrefs.KeyPrefsData;
             if (preferences == null || !preferences.keyPrefs.TryGetValue(bindingDef, out var binding))
@@ -668,14 +676,15 @@ namespace FcitxCjkInput {
         }
 
         private static void LogRootEvent(Event currentEvent, bool textFieldActive) {
-            if (!DebugLogging || (currentEvent.type != EventType.KeyDown &&
-                currentEvent.type != EventType.KeyUp))
+            if (!DebugLogging || (currentEvent.rawType != EventType.KeyDown &&
+                currentEvent.rawType != EventType.KeyUp))
                 return;
             WriteLog("ROOT " + DescribeEvent() + " engine=" + _engine + " ime=" +
                 Input.imeCompositionMode + " textFieldActive=" + textFieldActive +
                 " keyboardControl=" + GUIUtility.keyboardControl + " focusedControl=" +
                 _focusedControl + " compositionContext=" + Composition.ActiveContext +
-                " preedit=" + Composition.HasPreedit + " pending=" + Composition.PendingCount);
+                " preedit=" + Composition.HasPreedit + " pending=" + Composition.PendingCount +
+                (currentEvent.keyCode == KeyCode.RightAlt ? " physical=RightAlt" : ""));
         }
 
         private static void LogTextField(string stage, ControlToken target, int id, GUIContent content,
