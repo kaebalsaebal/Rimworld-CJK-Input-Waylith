@@ -44,6 +44,9 @@ namespace FcitxCjkInput {
             new ShortcutCommitGuard();
         private static readonly HashSet<uint> NativePressedKeys = new HashSet<uint>();
         private static readonly HashSet<uint> NativeConsumedKeys = new HashSet<uint>();
+        private static readonly HashSet<uint> WaylithConsumedKeys = new HashSet<uint>();
+        private static readonly List<WaylithRoutedKeyEvent> WaylithRoutedKeyEvents =
+            new List<WaylithRoutedKeyEvent>();
 
         private static StreamWriter _log;
         private static IntPtr _nativeHandle;
@@ -54,6 +57,10 @@ namespace FcitxCjkInput {
         private static NativeSetFocus _nativeSetFocus;
         private static NativeProcessKey _nativeProcessKey;
         private static MethodInfo _controlIdForRect;
+        private static MethodInfo _waylithShiftDown;
+        private static MethodInfo _waylithCtrlDown;
+        private static MethodInfo _waylithAltDown;
+        private static MethodInfo _waylithMetaDown;
         private static string _engine = "unknown";
         private static bool _nativeReady;
         private static bool _nativeDirectInputAvailable;
@@ -80,8 +87,6 @@ namespace FcitxCjkInput {
         private static bool _settingQuickSearchText;
         private static bool _quickSearchCaretSyncPending;
         private static int _quickSearchPendingCaret = -1;
-        private static bool _suppressRightAltKeyUp;
-        private static bool _consumeSuppressedRightAltKeyUp;
         private static IMECompositionMode _imeModeWithoutTextField = IMECompositionMode.Auto;
         private static int _quickSearchFocusFrame = -1;
         private static int _shuttingDown;
@@ -107,6 +112,14 @@ namespace FcitxCjkInput {
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int NativeProcessKey(uint keyval, uint keycode, uint state, int release,
             uint time);
+
+        private struct WaylithRoutedKeyEvent {
+            public int Frame;
+            public uint Keyval;
+            public bool Release;
+            public bool Accepted;
+            public bool Modifier;
+        }
 
         [DllImport("libdl.so.2")]
         private static extern IntPtr dlopen(string fileName, int flags);
@@ -217,6 +230,26 @@ namespace FcitxCjkInput {
 
             harmony.Patch(rootOnGui,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeRootOnGui)));
+
+            var waylithInputState = AccessTools.TypeByName("Waylith.Input.InputState");
+            var waylithOnKey = waylithInputState?.GetMethods(
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                .FirstOrDefault(method => {
+                    if (method.Name != "OnKey")
+                        return false;
+                    var parameters = method.GetParameters();
+                    return parameters.Length == 2 && parameters[0].ParameterType.IsEnum &&
+                        parameters[1].ParameterType == typeof(bool);
+                });
+            if (waylithOnKey != null) {
+                _waylithShiftDown = AccessTools.PropertyGetter(waylithInputState, "ShiftDown");
+                _waylithCtrlDown = AccessTools.PropertyGetter(waylithInputState, "CtrlDown");
+                _waylithAltDown = AccessTools.PropertyGetter(waylithInputState, "AltDown");
+                _waylithMetaDown = AccessTools.PropertyGetter(waylithInputState, "MetaDown");
+                harmony.Patch(waylithOnKey,
+                    prefix: new HarmonyMethod(typeof(FcitxCjkInputMod),
+                        nameof(BeforeWaylithInputKey)));
+            }
             harmony.Patch(desktopTextField,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeDesktopTextField)),
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterDesktopTextField)));
@@ -240,6 +273,7 @@ namespace FcitxCjkInput {
                     nameof(AfterPlaySettingsControls)));
             WriteLog("PATCH Root.OnGUI=" + rootOnGui + " textField=" + desktopTextField +
                 " textFieldImpl=" + textFieldImpl +
+                " waylithInputKey=" + (waylithOnKey?.ToString() ?? "unavailable") +
                 " quickSearch=" + quickSearch + " searchTextSetter=" + searchTextSetter +
                 " keyBindingIsDown=" + keyBindingIsDown + " keyBindingKeyDownEvent=" +
                 keyBindingKeyDownEvent + " playSettingsControls=" + playSettingsControls);
@@ -297,6 +331,8 @@ namespace FcitxCjkInput {
             _nativeFocusState = null;
             NativePressedKeys.Clear();
             NativeConsumedKeys.Clear();
+            WaylithConsumedKeys.Clear();
+            WaylithRoutedKeyEvents.Clear();
             var result = _nativeStart((uint)Process.GetCurrentProcess().Id);
             WriteLog("NATIVE start result=" + result);
             if (result != 0)
@@ -354,6 +390,8 @@ namespace FcitxCjkInput {
                 _nativeFocusState = null;
                 NativePressedKeys.Clear();
                 NativeConsumedKeys.Clear();
+                WaylithConsumedKeys.Clear();
+                WaylithRoutedKeyEvents.Clear();
                 Engines.Clear();
                 Composition.Reset();
                 CommittedCharacters.Clear();
@@ -523,6 +561,8 @@ namespace FcitxCjkInput {
 
         private static void BeforeRootOnGui() {
             var now = Stopwatch.GetTimestamp();
+            WaylithRoutedKeyEvents.RemoveAll(keyEvent =>
+                Time.frameCount - keyEvent.Frame > 3);
             if (_restartAt != 0 && now >= _restartAt)
                 StartNativeBridge();
             Composition.DiscardExpired(now);
@@ -552,6 +592,102 @@ namespace FcitxCjkInput {
             if (currentEvent == null)
                 return;
             LogRootEvent(currentEvent, textFieldActive);
+        }
+
+        private static bool BeforeWaylithInputKey(object __instance, object[] __args) {
+            if (__args == null || __args.Length < 2 || __args[0] == null ||
+                !(__args[1] is bool down))
+                return true;
+
+            var keyName = __args[0].ToString();
+            if (!_nativeDirectInputAvailable || !_nativeReady) {
+                if (DebugLogging)
+                    WriteLog("FCITX waylith-key skip=bridge-unavailable key=" + keyName +
+                        " ready=" + _nativeReady + " direct=" + _nativeDirectInputAvailable);
+                return true;
+            }
+            if (!_textFieldActive) {
+                if (DebugLogging)
+                    WriteLog("FCITX waylith-key skip=no-focused-textfield key=" + keyName + " " +
+                        DescribeEvent());
+                return true;
+            }
+            if (string.IsNullOrEmpty(keyName) || !TryGetFcitxKey(keyName, out var keyval)) {
+                if (DebugLogging)
+                    WriteLog("FCITX waylith-key skip=unmapped key=" + keyName + " " +
+                        DescribeEvent());
+                return true;
+            }
+
+            UpdateNativeFocus(true);
+            var state = WaylithModifierState(__instance);
+            var modifier = IsModifierKeysym(keyval);
+            var release = !down;
+            var accepted = false;
+
+            if (down) {
+                var keyDownState = RemoveModifierSelfState(keyval, state);
+                accepted = SendNativeKey(keyval, keyDownState, release: false);
+                NativePressedKeys.Add(keyval);
+                if (accepted)
+                    NativeConsumedKeys.Add(keyval);
+            } else if (NativePressedKeys.Remove(keyval)) {
+                accepted = SendNativeKey(keyval, state, release: true);
+                var consumed = NativeConsumedKeys.Remove(keyval);
+                if (consumed && !modifier)
+                    WaylithConsumedKeys.Add(keyval);
+            }
+
+            WaylithRoutedKeyEvents.Add(new WaylithRoutedKeyEvent {
+                Frame = Time.frameCount,
+                Keyval = keyval,
+                Release = release,
+                Accepted = accepted,
+                Modifier = modifier
+            });
+
+            if (DebugLogging)
+                WriteLog("FCITX key source=waylith-input-state key=" + keyName +
+                    " keysym=0x" + keyval.ToString("X") + " state=0x" + state.ToString("X") +
+                    " release=" + release + " accepted=" + accepted + " " +
+                    DescribeEvent());
+
+            // Suppress a consumed non-modifier press and its matching release before Waylith
+            // creates Unity events. Modifier events must reach InputState so its modifier
+            // bookkeeping remains balanced.
+            if (down && accepted && !modifier)
+                return false;
+            if (release && !modifier && WaylithConsumedKeys.Remove(keyval))
+                return false;
+            return true;
+        }
+
+        private static uint WaylithModifierState(object inputState) {
+            var state = 0u;
+            if (ReadWaylithModifier(inputState, _waylithShiftDown, EventModifiers.Shift))
+                state |= 1u << 0;
+            if (ReadWaylithModifier(inputState, _waylithCtrlDown, EventModifiers.Control))
+                state |= 1u << 2;
+            if (ReadWaylithModifier(inputState, _waylithAltDown, EventModifiers.Alt))
+                state |= 1u << 3;
+            if (ReadWaylithModifier(inputState, _waylithMetaDown, EventModifiers.Command))
+                state |= 1u << 6;
+            if (Event.current != null &&
+                (Event.current.modifiers & EventModifiers.CapsLock) != 0)
+                state |= 1u << 1;
+            return state;
+        }
+
+        private static bool ReadWaylithModifier(object inputState, MethodInfo getter,
+            EventModifiers fallback) {
+            if (inputState != null && getter != null) {
+                try {
+                    return (bool)getter.Invoke(inputState, null);
+                } catch {
+                    // The Unity event state below is a safe fallback if Waylith changes its API.
+                }
+            }
+            return Event.current != null && (Event.current.modifiers & fallback) != 0;
         }
 
         private static void BeforeDesktopTextField(Rect position, int id, GUIContent content,
@@ -1023,50 +1159,24 @@ namespace FcitxCjkInput {
             if (rawType != EventType.KeyDown && rawType != EventType.KeyUp)
                 return false;
             var release = rawType == EventType.KeyUp;
-            if (release && _suppressRightAltKeyUp &&
-                (currentEvent.keyCode == KeyCode.RightAlt ||
-                    (currentEvent.keyCode == KeyCode.None && currentEvent.character == '\0'))) {
-                var consume = _consumeSuppressedRightAltKeyUp;
-                _suppressRightAltKeyUp = false;
-                _consumeSuppressedRightAltKeyUp = false;
-                if (consume)
+            var hasEventKey = TryGetFcitxKey(currentEvent, out var keyval);
+            if (TryConsumeWaylithRoutedEvent(currentEvent, hasEventKey, keyval, release,
+                    out var waylithAccepted)) {
+                if (waylithAccepted)
                     currentEvent.Use();
                 if (DebugLogging)
-                    WriteLog("FCITX key source=" + source +
-                        " key=RightAlt release=True synthetic-tap-followup=suppressed " +
-                        " consumed=" + consume + " " +
+                    WriteLog("FCITX key source=" + source + " forwarded=waylith " +
+                        "release=" + release + " accepted=" + waylithAccepted + " " +
                         DescribeEvent());
-                return consume;
+                return waylithAccepted;
             }
-            if (!TryGetFcitxKey(currentEvent, out var keyval))
+            if (!hasEventKey)
                 return false;
 
-            if (!release && keyval == 0xffea) {
-                _suppressRightAltKeyUp = false;
-                _consumeSuppressedRightAltKeyUp = false;
-            }
             var keyName = currentEvent.keyCode.ToString();
             var state = FcitxModifierState(currentEvent.modifiers);
             if (!release) {
                 var keyDownState = RemoveModifierSelfState(keyval, state);
-                if (keyval == 0xffea &&
-                    (keyDownState & ((1u << 0) | (1u << 2) | (1u << 3) | (1u << 6))) == 0) {
-                    // Waylith may omit RightAlt KeyUp, so send the configured one-key trigger
-                    // as a complete press/release pair and suppress its late physical release.
-                    var acceptedPress = SendNativeKey(keyval, keyDownState, release: false);
-                    var acceptedRelease = SendNativeKey(keyval, keyDownState, release: true);
-                    _suppressRightAltKeyUp = true;
-                    _consumeSuppressedRightAltKeyUp = acceptedPress || acceptedRelease;
-                    if (acceptedPress || acceptedRelease)
-                        currentEvent.Use();
-                    if (DebugLogging)
-                        WriteLog("FCITX key source=" + source + " key=RightAlt keysym=0x" +
-                            keyval.ToString("X") + " state=0x" + keyDownState.ToString("X") +
-                            " release=False synthetic-tap=True acceptedPress=" + acceptedPress +
-                            " acceptedRelease=" + acceptedRelease + " " + DescribeEvent());
-                    return acceptedPress || acceptedRelease;
-                }
-
                 var accepted = SendNativeKey(keyval, keyDownState, release: false);
                 NativePressedKeys.Add(keyval);
                 if (accepted) {
@@ -1132,6 +1242,28 @@ namespace FcitxCjkInput {
             return accepted;
         }
 
+        private static bool TryConsumeWaylithRoutedEvent(Event currentEvent, bool hasEventKey,
+            uint keyval, bool release, out bool accepted) {
+            accepted = false;
+            for (var index = 0; index < WaylithRoutedKeyEvents.Count; index++) {
+                var routed = WaylithRoutedKeyEvents[index];
+                if (routed.Release != release || Time.frameCount - routed.Frame > 1)
+                    continue;
+
+                var matches = hasEventKey
+                    ? routed.Keyval == keyval
+                    : currentEvent.keyCode == KeyCode.None && currentEvent.character == '\0' &&
+                        routed.Modifier;
+                if (!matches)
+                    continue;
+
+                accepted = routed.Accepted;
+                WaylithRoutedKeyEvents.RemoveAt(index);
+                return true;
+            }
+            return false;
+        }
+
         private static bool SendNativeKey(uint keyval, uint state, bool release) {
             if (_nativeProcessKey == null)
                 return false;
@@ -1143,36 +1275,56 @@ namespace FcitxCjkInput {
         private static bool TryGetFcitxKey(Event currentEvent, out uint keyval) {
             var name = currentEvent.keyCode.ToString();
             var character = currentEvent.character;
-            if (name == "None" &&
-                (currentEvent.modifiers & EventModifiers.Alt) != 0) {
-                keyval = 0xffea; // Waylith can expose a modifier-only RightAlt event.
-                return true;
-            }
             if (name == "None" && character >= ' ' && character != '\u007f' &&
                 !(character >= '\ud800' && character <= '\udfff')) {
                 keyval = UnicodeKeysym(character);
                 return true;
             }
+            if (TryGetFcitxKey(name, out keyval))
+                return true;
+            if (character >= ' ' && character != '\u007f' &&
+                !(character >= '\ud800' && character <= '\udfff')) {
+                keyval = UnicodeKeysym(character);
+                return true;
+            }
+            keyval = 0;
+            return false;
+        }
 
+        private static bool TryGetFcitxKey(string name, out uint keyval) {
+            if (string.IsNullOrEmpty(name)) {
+                keyval = 0;
+                return false;
+            }
             if (name.Length == 1 && char.IsLetter(name[0])) {
                 keyval = char.ToLowerInvariant(name[0]);
                 return true;
             }
-            if (name.StartsWith("Alpha", StringComparison.Ordinal) && name.Length == 6 &&
-                char.IsDigit(name[5])) {
-                keyval = (uint)name[5];
-                return true;
+            if ((name.StartsWith("Alpha", StringComparison.Ordinal) && name.Length == 6) ||
+                (name.StartsWith("Digit", StringComparison.Ordinal) && name.Length == 6)) {
+                var digit = name[5];
+                if (char.IsDigit(digit)) {
+                    keyval = (uint)digit;
+                    return true;
+                }
             }
-            if (name.StartsWith("Keypad", StringComparison.Ordinal) && name.Length == 7 &&
-                char.IsDigit(name[6])) {
-                keyval = 0xffb0u + (uint)(name[6] - '0');
-                return true;
+            if ((name.StartsWith("Keypad", StringComparison.Ordinal) && name.Length == 7) ||
+                (name.StartsWith("Numpad", StringComparison.Ordinal) && name.Length == 7) ||
+                (name.StartsWith("Kp", StringComparison.Ordinal) && name.Length == 3)) {
+                var digit = name[name.Length - 1];
+                if (char.IsDigit(digit)) {
+                    keyval = 0xffb0u + (uint)(digit - '0');
+                    return true;
+                }
             }
 
             switch (name) {
                 case "Space": keyval = 0x20; return true;
-                case "Return": keyval = 0xff0d; return true;
-                case "KeypadEnter": keyval = 0xff8d; return true;
+                case "Return":
+                case "Enter": keyval = 0xff0d; return true;
+                case "KeypadEnter":
+                case "NumpadEnter":
+                case "KpEnter": keyval = 0xff8d; return true;
                 case "Tab": keyval = 0xff09; return true;
                 case "Backspace": keyval = 0xff08; return true;
                 case "Escape": keyval = 0xff1b; return true;
@@ -1186,24 +1338,53 @@ namespace FcitxCjkInput {
                 case "UpArrow": keyval = 0xff52; return true;
                 case "RightArrow": keyval = 0xff53; return true;
                 case "DownArrow": keyval = 0xff54; return true;
+                case "Left": keyval = 0xff51; return true;
+                case "Up": keyval = 0xff52; return true;
+                case "Right": keyval = 0xff53; return true;
+                case "Down": keyval = 0xff54; return true;
                 case "LeftShift": keyval = 0xffe1; return true;
                 case "RightShift": keyval = 0xffe2; return true;
                 case "LeftControl": keyval = 0xffe3; return true;
+                case "LeftCtrl": keyval = 0xffe3; return true;
                 case "RightControl": keyval = 0xffe4; return true;
+                case "RightCtrl": keyval = 0xffe4; return true;
                 case "LeftAlt": keyval = 0xffe9; return true;
                 case "RightAlt": keyval = 0xffea; return true;
                 case "LeftCommand": keyval = 0xffeb; return true;
+                case "LeftMeta":
+                case "LeftSuper": keyval = 0xffeb; return true;
                 case "RightCommand": keyval = 0xffec; return true;
+                case "RightMeta":
+                case "RightSuper": keyval = 0xffec; return true;
+                case "ContextMenu":
+                case "Menu": keyval = 0xff67; return true;
+                case "CapsLock": keyval = 0xffe5; return true;
+                case "NumLock": keyval = 0xff7f; return true;
+                case "ScrollLock": keyval = 0xff14; return true;
+                case "PrintScreen": keyval = 0xff61; return true;
+                case "Pause": keyval = 0xff13; return true;
+                case "Backquote": keyval = 0x60; return true;
+                case "Quote": keyval = 0x27; return true;
+                case "Semicolon":
+                case "OEM1": keyval = 0x3b; return true;
+                case "Comma": keyval = 0x2c; return true;
+                case "Period": keyval = 0x2e; return true;
+                case "Slash":
+                case "OEM2": keyval = 0x2f; return true;
+                case "Backslash": keyval = 0x5c; return true;
+                case "LeftBracket": keyval = 0x5b; return true;
+                case "RightBracket": keyval = 0x5d; return true;
+                case "Minus": keyval = 0x2d; return true;
+                case "Equals": keyval = 0x3d; return true;
+                case "Hangul":
+                case "Hangeul": keyval = 0xff31; return true;
+                case "HangulHanja":
+                case "Hanja": keyval = 0xff34; return true;
             }
             if (name.Length >= 2 && name[0] == 'F' &&
                 int.TryParse(name.Substring(1), out var functionKey) &&
                 functionKey >= 1 && functionKey <= 35) {
                 keyval = 0xffbeu + (uint)(functionKey - 1);
-                return true;
-            }
-            if (character >= ' ' && character != '\u007f' &&
-                !(character >= '\ud800' && character <= '\udfff')) {
-                keyval = UnicodeKeysym(character);
                 return true;
             }
             keyval = 0;
@@ -1256,7 +1437,7 @@ namespace FcitxCjkInput {
                 " keyboardControl=" + GUIUtility.keyboardControl + " focusedControl=" +
                 _focusedControl + " compositionContext=" + Composition.ActiveContext +
                 " preedit=" + Composition.HasPreedit + " pending=" + Composition.PendingCount +
-                (currentEvent.keyCode == KeyCode.RightAlt ? " physical=RightAlt" : ""));
+                (currentEvent.keyCode == KeyCode.None ? " unresolved-keycode" : ""));
         }
 
         private static void LogTextField(string stage, ControlToken target, int id, GUIContent content,

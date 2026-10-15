@@ -61,7 +61,7 @@ Unity 2022는 SDL2 fcitx5 입력 컨텍스트를 생성하지만 Linux IME 커�
 5. 커서 이동을 유지하면서 해당 앵커에 텍스트를 커밋합니다.
 6. 저장된 필드 값을 변경하지 않고 프리에디트 텍스트와 커서를 그립니다.
 
-물리 IME 전환 키는 계속 KWin/fcitx5가 처리합니다. 이 모드는 `/dev/input`을 사용하거나, fcitx5 상태를 폴링하거나, 임시 실행 파일을 생성하거나, 별도의 헬퍼 프로세스를 시작하지 않습니다.
+텍스트 입력 필드에 포커스가 있으면 Waylith의 실제 키 입력과 눌림/뗌 이벤트를 Fcitx 입력 컨텍스트로 전달합니다. 따라서 특정 전환 키를 모드에 고정하지 않고 Fcitx의 **입력기 변환** 단축키 설정을 따릅니다. 이 모드는 `/dev/input`을 사용하거나, fcitx5 상태를 폴링하거나, 임시 실행 파일을 생성하거나, 별도의 헬퍼 프로세스를 시작하지 않습니다.
 
 **옵션 → 모드 설정 → Fcitx CJK Input**에서 **Debug log**를 활성화하여 진단 오버레이를 표시하고 자세한 진단 로그를 `/tmp/fcitxcjkinput.log`에 기록할 수 있습니다.
 
@@ -133,7 +133,7 @@ Unity 2022 creates an SDL2 fcitx5 input context but does not connect its Linux I
 5. commits text at that anchor while preserving cursor navigation
 6. draws preedit text and its cursor without changing the saved field value
 
-The physical IME toggle key remains handled by KWin/fcitx5. The mod does not use `/dev/input`, poll fcitx5 state, create a temporary executable, or start a separate helper process.
+When a text field is focused, Waylith's physical key press and release events are sent to the Fcitx input context. Fcitx therefore applies the configured **Input Method Switch** shortcuts; the mod does not hardcode a toggle key. The mod does not use `/dev/input`, poll fcitx5 state, create a temporary executable, or start a separate helper process.
 
 enabling **Debug log** under **Options → Mod settings → Fcitx CJK Input** will enable diagnostic overlay and write verbose diagnostics to `/tmp/fcitxcjkinput.log`.
 
