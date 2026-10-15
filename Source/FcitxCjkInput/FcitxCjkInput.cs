@@ -64,6 +64,7 @@ namespace FcitxCjkInput {
         private static string _engine = "unknown";
         private static bool _nativeReady;
         private static bool _nativeDirectInputAvailable;
+        private static bool _waylithInputKeyPatched;
         private static bool? _nativeFocusState;
         private static long _nativeFocusRetryAt;
         private static bool _nativeLoaded;
@@ -147,7 +148,8 @@ namespace FcitxCjkInput {
                 Log.Message("[CJK] fcitx5 SDL/IMGUI bridge initialized; " +
                     (DebugLogging ? "log=" + LogPath : "debug log disabled"));
             } catch (Exception exception) {
-                WriteLog("FATAL " + exception);
+                if (DebugLogging)
+                    WriteLog("FATAL " + exception);
                 Shutdown();
                 Log.Error("[CJK] initialization failed: " + exception);
             }
@@ -174,11 +176,12 @@ namespace FcitxCjkInput {
         }
 
         private static void WriteRuntimeHeader(string reason) {
-            WriteLog(reason + " unity=" + Application.unityVersion + " pid=" +
-                Process.GetCurrentProcess().Id + " XMODIFIERS=" +
-                Environment.GetEnvironmentVariable("XMODIFIERS") + " SDL_IM_MODULE=" +
-                Environment.GetEnvironmentVariable("SDL_IM_MODULE") + " engine=" + _engine +
-                " native=" + _nativeReady + " ime=" + Input.imeCompositionMode);
+            if (DebugLogging)
+                WriteLog(reason + " unity=" + Application.unityVersion + " pid=" +
+                    Process.GetCurrentProcess().Id + " XMODIFIERS=" +
+                    Environment.GetEnvironmentVariable("XMODIFIERS") + " SDL_IM_MODULE=" +
+                    Environment.GetEnvironmentVariable("SDL_IM_MODULE") + " engine=" + _engine +
+                    " native=" + _nativeReady + " ime=" + Input.imeCompositionMode);
         }
 
         private static void Patch() {
@@ -246,9 +249,10 @@ namespace FcitxCjkInput {
                 _waylithCtrlDown = AccessTools.PropertyGetter(waylithInputState, "CtrlDown");
                 _waylithAltDown = AccessTools.PropertyGetter(waylithInputState, "AltDown");
                 _waylithMetaDown = AccessTools.PropertyGetter(waylithInputState, "MetaDown");
-            harmony.Patch(waylithOnKey,
+                harmony.Patch(waylithOnKey,
                     prefix: new HarmonyMethod(typeof(FcitxCjkInputMod),
                         nameof(BeforeWaylithInputKey)));
+                _waylithInputKeyPatched = true;
             }
             harmony.Patch(desktopTextField,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeDesktopTextField)),
@@ -272,12 +276,13 @@ namespace FcitxCjkInput {
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod),
                     nameof(AfterPlaySettingsControls)));
             
-            WriteLog("PATCH Root.OnGUI=" + rootOnGui + " textField=" + desktopTextField +
-                " textFieldImpl=" + textFieldImpl +
-                " waylithInputKey=" + (waylithOnKey?.ToString() ?? "unavailable") +
-                " quickSearch=" + quickSearch + " searchTextSetter=" + searchTextSetter +
-                " keyBindingIsDown=" + keyBindingIsDown + " keyBindingKeyDownEvent=" +
-                keyBindingKeyDownEvent + " playSettingsControls=" + playSettingsControls);
+            if (DebugLogging)
+                WriteLog("PATCH Root.OnGUI=" + rootOnGui + " textField=" + desktopTextField +
+                    " textFieldImpl=" + textFieldImpl +
+                    " waylithInputKey=" + (waylithOnKey?.ToString() ?? "unavailable") +
+                    " quickSearch=" + quickSearch + " searchTextSetter=" + searchTextSetter +
+                    " keyBindingIsDown=" + keyBindingIsDown + " keyBindingKeyDownEvent=" +
+                    keyBindingKeyDownEvent + " playSettingsControls=" + playSettingsControls);
             
         }
 
@@ -301,8 +306,9 @@ namespace FcitxCjkInput {
             _nativeProcessKey = TryLoadNativeFunction<NativeProcessKey>("fcitx_bridge_process_key");
             _nativeDirectInputAvailable = _nativeSetFocus != null && _nativeProcessKey != null;
             _nativeLoaded = true;
-            WriteLog("NATIVE loaded path=" + path);
-            if (!_nativeDirectInputAvailable)
+            if (DebugLogging)
+                WriteLog("NATIVE loaded path=" + path);
+            if (DebugLogging && !_nativeDirectInputAvailable)
                 WriteLog("NATIVE direct input exports missing; rebuild libfcitxcjkinput.so");
         }
 
@@ -336,7 +342,8 @@ namespace FcitxCjkInput {
             WaylithConsumedKeys.Clear();
             WaylithRoutedKeyEvents.Clear();
             var result = _nativeStart((uint)Process.GetCurrentProcess().Id);
-            WriteLog("NATIVE start result=" + result);
+            if (DebugLogging)
+                WriteLog("NATIVE start result=" + result);
             if (result != 0)
                 ScheduleNativeRestart();
         }
@@ -364,18 +371,21 @@ namespace FcitxCjkInput {
                 try {
                     HandleNativeMessage(line);
                 } catch (Exception exception) {
-                    WriteLog("RX error line=[" + Escape(line) + "] exception=" + exception);
+                    if (DebugLogging)
+                        WriteLog("RX error line=[" + Escape(line) + "] exception=" + exception);
                 }
             }
         }
 
         private static void HandleNativeMessage(string line) {
             if (line.StartsWith("LOG:", StringComparison.Ordinal)) {
-                WriteLog("NATIVE " + line.Substring(4));
+                if (DebugLogging)
+                    WriteLog("NATIVE " + line.Substring(4));
                 return;
             }
             if (line.StartsWith("ERROR:", StringComparison.Ordinal)) {
-                WriteLog("NATIVE " + line);
+                if (DebugLogging)
+                    WriteLog("NATIVE " + line);
                 return;
             }
 
@@ -403,7 +413,8 @@ namespace FcitxCjkInput {
                 return;
             }
             if (!line.StartsWith("EVENT:", StringComparison.Ordinal)) {
-                WriteLog("RX unknown line=[" + Escape(line) + "]");
+                if (DebugLogging)
+                    WriteLog("RX unknown line=[" + Escape(line) + "]");
                 return;
             }
 
@@ -524,7 +535,8 @@ namespace FcitxCjkInput {
                 }
                 return;
             }
-            WriteLog("RX unknown event kind=" + kind + " payload=[" + Escape(payload) + "]");
+            if (DebugLogging)
+                WriteLog("RX unknown event kind=" + kind + " payload=[" + Escape(payload) + "]");
         }
 
         private static void ClearShortcutComposition(int contextId) {
@@ -682,9 +694,9 @@ namespace FcitxCjkInput {
 
         private static bool ReadWaylithModifier(object inputState, MethodInfo getter,
             EventModifiers fallback) {
-            if (inputState != null && getter != null) {
+            if (getter != null && (getter.IsStatic || inputState != null)) {
                 try {
-                    return (bool)getter.Invoke(inputState, null);
+                    return (bool)getter.Invoke(getter.IsStatic ? null : inputState, null);
                 } catch {
                     // The Unity event state below is a safe fallback if Waylith changes its API.
                 }
@@ -853,12 +865,13 @@ namespace FcitxCjkInput {
                 (currentEvent.rawType != EventType.KeyDown &&
                     currentEvent.rawType != EventType.KeyUp))
                 return;
-            WriteLog(stage + " control=" + id + " token=" + target.Id + ":" +
-                target.Generation + " keyboardControl=" + GUIUtility.keyboardControl +
-                " hotControl=" + GUIUtility.hotControl + " text=[" + Escape(text) +
-                "] editor=[" + Escape(editor.text) + "] cursor=" + editor.cursorIndex +
-                " select=" + editor.selectIndex + " multiline=" + multiline + " " +
-                DescribeEvent());
+            if (DebugLogging)
+                WriteLog(stage + " control=" + id + " token=" + target.Id + ":" +
+                    target.Generation + " keyboardControl=" + GUIUtility.keyboardControl +
+                    " hotControl=" + GUIUtility.hotControl + " text=[" + Escape(text) +
+                    "] editor=[" + Escape(editor.text) + "] cursor=" + editor.cursorIndex +
+                    " select=" + editor.selectIndex + " multiline=" + multiline + " " +
+                    DescribeEvent());
         }
 
         private static void BeforeQuickSearch(QuickSearchWidget __instance, out string __state) {
@@ -901,9 +914,10 @@ namespace FcitxCjkInput {
                 currentEvent.rawType == EventType.KeyUp);
             if (__state == __instance.filter.Text && (!focused || !keyEvent))
                 return;
-            WriteLog("SEARCH filter=" + RuntimeHelpers.GetHashCode(__instance.filter) +
-                " before=[" + Escape(__state) + "] after=[" + Escape(__instance.filter.Text) +
-                "] focused=" + focused + " " + DescribeEvent());
+            if (DebugLogging)
+                WriteLog("SEARCH filter=" + RuntimeHelpers.GetHashCode(__instance.filter) +
+                    " before=[" + Escape(__state) + "] after=[" + Escape(__instance.filter.Text) +
+                    "] focused=" + focused + " " + DescribeEvent());
         }
 
         private static void BeforeSearchTextSet(QuickSearchFilter __instance, ref string value) {
@@ -1172,6 +1186,17 @@ namespace FcitxCjkInput {
                         DescribeEvent());
                 return waylithAccepted;
             }
+            // On RimWorld 1.7, Waylith's InputState.OnKey is the authoritative physical-key
+            // source. IMGUI still needs to consume matching routed events, but must not send
+            // unmatched keys a second time through fcitx. Keep this path as a fallback for
+            // builds where Waylith's input hook is unavailable.
+            if (_waylithInputKeyPatched) {
+                if (DebugLogging)
+                    WriteLog("FCITX key source=" + source +
+                        " skipped=waylith-input-authoritative release=" + release + " " +
+                        DescribeEvent());
+                return false;
+            }
             if (!hasEventKey)
                 return false;
 
@@ -1224,7 +1249,8 @@ namespace FcitxCjkInput {
         }
 
         private static bool ProcessNativeTextCharacter(Event currentEvent, string source) {
-            if (!_nativeDirectInputAvailable || !_nativeReady || !_textFieldActive ||
+            if (_waylithInputKeyPatched || !_nativeDirectInputAvailable || !_nativeReady ||
+                !_textFieldActive ||
                 currentEvent == null || _nativeProcessKey == null ||
                 currentEvent.character < ' ' || currentEvent.character == '\u007f' ||
                 currentEvent.character >= '\ud800' && currentEvent.character <= '\udfff')
@@ -1382,6 +1408,12 @@ namespace FcitxCjkInput {
                 case "Hangeul": keyval = 0xff31; return true;
                 case "HangulHanja":
                 case "Hanja": keyval = 0xff34; return true;
+                case "NumpadDivide": keyval = 0xffaf; return true;
+                case "NumpadMultiply": keyval = 0xffaa; return true;
+                case "NumpadPlus": keyval = 0xffab; return true;
+                case "NumpadMinus": keyval = 0xffad; return true;
+                case "NumpadPeriod": keyval = 0xffae; return true;
+                case "NumpadEquals": keyval = 0xffbd; return true;
             }
             if (name.Length >= 2 && name[0] == 'F' &&
                 int.TryParse(name.Substring(1), out var functionKey) &&
@@ -1434,12 +1466,13 @@ namespace FcitxCjkInput {
             if (!DebugLogging || (currentEvent.rawType != EventType.KeyDown &&
                 currentEvent.rawType != EventType.KeyUp))
                 return;
-            WriteLog("ROOT " + DescribeEvent() + " engine=" + _engine + " ime=" +
-                Input.imeCompositionMode + " textFieldActive=" + textFieldActive +
-                " keyboardControl=" + GUIUtility.keyboardControl + " focusedControl=" +
-                _focusedControl + " compositionContext=" + Composition.ActiveContext +
-                " preedit=" + Composition.HasPreedit + " pending=" + Composition.PendingCount +
-                (currentEvent.keyCode == KeyCode.None ? " unresolved-keycode" : ""));
+            if (DebugLogging)
+                WriteLog("ROOT " + DescribeEvent() + " engine=" + _engine + " ime=" +
+                    Input.imeCompositionMode + " textFieldActive=" + textFieldActive +
+                    " keyboardControl=" + GUIUtility.keyboardControl + " focusedControl=" +
+                    _focusedControl + " compositionContext=" + Composition.ActiveContext +
+                    " preedit=" + Composition.HasPreedit + " pending=" + Composition.PendingCount +
+                    (currentEvent.keyCode == KeyCode.None ? " unresolved-keycode" : ""));
         }
 
         private static void LogTextField(string stage, ControlToken target, int id, GUIContent content,
@@ -1449,15 +1482,16 @@ namespace FcitxCjkInput {
                 (currentEvent.rawType != EventType.KeyDown &&
                     currentEvent.rawType != EventType.KeyUp))
                 return;
-            WriteLog(stage + " control=" + id + " token=" + target.Id + ":" + target.Generation +
-                " keyboardControl=" + GUIUtility.keyboardControl + " hotControl=" +
-                GUIUtility.hotControl + " contentObject=" + RuntimeHelpers.GetHashCode(content) +
-                " editorObject=" + RuntimeHelpers.GetHashCode(editor) + " content=[" +
-                Escape(content.text) + "] editor=[" + Escape(editor.text) + "] cursor=" +
-                editor.cursorIndex + " select=" + editor.selectIndex +
-                //" graphicalCursor=" + editor.graphicalCursorPos +
-                " multiline=" + editor.multiline + " guiChanged=" +
-                GUI.changed + " " + DescribeEvent());
+            if (DebugLogging)
+                WriteLog(stage + " control=" + id + " token=" + target.Id + ":" + target.Generation +
+                    " keyboardControl=" + GUIUtility.keyboardControl + " hotControl=" +
+                    GUIUtility.hotControl + " contentObject=" + RuntimeHelpers.GetHashCode(content) +
+                    " editorObject=" + RuntimeHelpers.GetHashCode(editor) + " content=[" +
+                    Escape(content.text) + "] editor=[" + Escape(editor.text) + "] cursor=" +
+                    editor.cursorIndex + " select=" + editor.selectIndex +
+                    //" graphicalCursor=" + editor.graphicalCursorPos +
+                    " multiline=" + editor.multiline + " guiChanged=" +
+                    GUI.changed + " " + DescribeEvent());
         }
 
         private static string DescribeEvent() {
