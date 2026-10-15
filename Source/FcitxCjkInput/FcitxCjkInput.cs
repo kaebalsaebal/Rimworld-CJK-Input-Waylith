@@ -63,6 +63,7 @@ namespace FcitxCjkInput {
         private static long _focusGeneration;
         private static bool _logInitialized;
         private static bool _textFieldActive;
+        private static bool _searchWidgetFocused;
         private static int _shuttingDown;
         private static long _lastLogFlush;
 
@@ -458,8 +459,15 @@ namespace FcitxCjkInput {
                 _focusedControl = 0;
                 Composition.Blur();
             }
+            var searchWidgetFocused = Find.WindowStack.AnySearchWidgetFocused;
+            if (searchWidgetFocused != _searchWidgetFocused) {
+                _searchWidgetFocused = searchWidgetFocused;
+                if (DebugLogging)
+                    WriteLog("STATE search-focus=" + searchWidgetFocused + " frame=" +
+                        Time.frameCount + " keyboardControl=" + GUIUtility.keyboardControl);
+            }
             var textFieldActive = ImeRouting.TextFieldIsActive(GUIUtility.keyboardControl,
-                _focusedControl, _focusedTextFieldFrame, Time.frameCount);
+                _focusedControl, _focusedTextFieldFrame, Time.frameCount, searchWidgetFocused);
             _textFieldActive = textFieldActive;
             if (_nativePollFrame != Time.frameCount) {
                 _nativePollFrame = Time.frameCount;
@@ -525,6 +533,11 @@ namespace FcitxCjkInput {
 
         private static void BeforeQuickSearch(QuickSearchWidget __instance, out string __state) {
             __state = __instance.filter.Text;
+            if (__instance.CurrentlyFocused()) {
+                _searchWidgetFocused = true;
+                _textFieldActive = true;
+                SetImeCompositionMode(true, "quick-search");
+            }
         }
 
         private static void AfterQuickSearch(QuickSearchWidget __instance, string __state) {

@@ -21,9 +21,9 @@ namespace FcitxCjkInput {
 
     internal static class ImeRouting {
         public static bool TextFieldIsActive(int keyboardControl, int focusedControl,
-            int lastSeenFrame, int currentFrame) {
-            return keyboardControl != 0 && keyboardControl == focusedControl &&
-                currentFrame - lastSeenFrame <= 1;
+            int lastSeenFrame, int currentFrame, bool searchWidgetFocused = false) {
+            return searchWidgetFocused || (keyboardControl != 0 &&
+                keyboardControl == focusedControl && currentFrame - lastSeenFrame <= 1);
         }
 
         public static bool IsImeEngine(string engine) {
