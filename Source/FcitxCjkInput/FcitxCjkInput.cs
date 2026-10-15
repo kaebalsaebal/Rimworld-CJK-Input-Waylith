@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -52,6 +53,7 @@ namespace FcitxCjkInput {
         private static NativeStop _nativeStop;
         private static NativeSetFocus _nativeSetFocus;
         private static NativeProcessKey _nativeProcessKey;
+        private static MethodInfo _controlIdForRect;
         private static string _engine = "unknown";
         private static bool _nativeReady;
         private static bool _nativeDirectInputAvailable;
@@ -63,6 +65,7 @@ namespace FcitxCjkInput {
         private static int _nativePollFrame = -1;
         private static long _restartAt;
         private static int _focusedControl;
+        private static int _desktopTextFieldDepth;
         private static int _focusedTextFieldFrame = -10;
         private static int _lastZContext;
         private static int _unboundPreeditContext;
@@ -76,6 +79,8 @@ namespace FcitxCjkInput {
         private static string _quickSearchCommittedText = "";
         private static string _quickSearchRenderedText = "";
         private static bool _settingQuickSearchText;
+        private static bool _quickSearchCaretSyncPending;
+        private static int _quickSearchPendingCaret = -1;
         private static IMECompositionMode _imeModeWithoutTextField = IMECompositionMode.Auto;
         private static int _quickSearchFocusFrame = -1;
         private static int _shuttingDown;
@@ -170,6 +175,11 @@ namespace FcitxCjkInput {
                 typeof(Rect), typeof(int), typeof(GUIContent), typeof(bool), typeof(int),
                 typeof(GUIStyle)
             });
+            var textFieldImpl = AccessTools.Method(typeof(GUI), "TextFieldImpl", new[] {
+                typeof(Rect), typeof(string), typeof(GUIStyle), typeof(bool)
+            });
+            _controlIdForRect = AccessTools.Method(typeof(GUI), "ControlIdFor",
+                new[] { typeof(Rect) });
             var drawTextAreaContent = AccessTools.Method(typeof(GUI), "DrawTextAreaContent");
             var quickSearch = AccessTools.Method(typeof(QuickSearchWidget), nameof(QuickSearchWidget.OnGUI));
             var searchTextSetter = AccessTools.PropertySetter(typeof(QuickSearchFilter),
@@ -186,6 +196,10 @@ namespace FcitxCjkInput {
             //    throw new MissingMethodException("UnityEngine.GUI.HandleTextFieldEventForDesktop");
             if (desktopTextField == null)
                 throw new MissingMethodException("UnityEngine.GUI.DoTextField(Rect, Int32, GUIContent, Boolean, Int32, GUIStyle)");
+            if (textFieldImpl == null)
+                throw new MissingMethodException("UnityEngine.GUI.TextFieldImpl(Rect, String, GUIStyle, Boolean)");
+            if (_controlIdForRect == null)
+                throw new MissingMethodException("UnityEngine.GUI.ControlIdFor(Rect)");
             if (drawTextAreaContent == null)
                 throw new MissingMethodException("UnityEngine.GUI.DrawTextAreaContent");
             if (quickSearch == null)
@@ -205,6 +219,9 @@ namespace FcitxCjkInput {
             harmony.Patch(desktopTextField,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeDesktopTextField)),
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterDesktopTextField)));
+            harmony.Patch(textFieldImpl,
+                prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeTextFieldImpl)),
+                postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterTextFieldImpl)));
             harmony.Patch(drawTextAreaContent,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeDrawTextAreaContent)));
             harmony.Patch(quickSearch,
@@ -221,6 +238,7 @@ namespace FcitxCjkInput {
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod),
                     nameof(AfterPlaySettingsControls)));
             WriteLog("PATCH Root.OnGUI=" + rootOnGui + " textField=" + desktopTextField +
+                " textFieldImpl=" + textFieldImpl +
                 " quickSearch=" + quickSearch + " searchTextSetter=" + searchTextSetter +
                 " keyBindingIsDown=" + keyBindingIsDown + " keyBindingKeyDownEvent=" +
                 keyBindingKeyDownEvent + " playSettingsControls=" + playSettingsControls);
@@ -536,6 +554,10 @@ namespace FcitxCjkInput {
 
         private static void BeforeDesktopTextField(Rect position, int id, GUIContent content,
             bool multiline, int maxLength, GUIStyle style) {
+            _desktopTextFieldDepth++;
+            if (GUIUtility.keyboardControl != id)
+                return;
+
             var editor = (TextEditor)GUIUtility.GetStateObject(typeof(TextEditor), id);
             var target = ObserveEditor(id, editor);
             LogTextField("FIELD before-original", target, id, content, editor);
@@ -576,14 +598,121 @@ namespace FcitxCjkInput {
 
         private static void AfterDesktopTextField(Rect position, int id, GUIContent content,
             bool multiline, int maxLength, GUIStyle style) {
+            _desktopTextFieldDepth = Math.Max(0, _desktopTextFieldDepth - 1);
+            if (Event.current != null && Event.current.type == EventType.Repaint &&
+                DebugLogging && _overlayFrame != Time.frameCount) {
+                _overlayFrame = Time.frameCount;
+                DrawOverlay();
+            }
+            if (GUIUtility.keyboardControl != id)
+                return;
+
             var editor = (TextEditor)GUIUtility.GetStateObject(typeof(TextEditor), id);
             var target = ObserveEditor(id, editor);
             LogTextField("FIELD after-original", target, id, content, editor);
 
-            if (Event.current.type == EventType.Repaint && DebugLogging && _overlayFrame != Time.frameCount) {
-                _overlayFrame = Time.frameCount;
-                DrawOverlay();
+        }
+
+        private static void BeforeTextFieldImpl(Rect rect, ref string text, GUIStyle style,
+            bool multiline) {
+            if (_desktopTextFieldDepth > 0 || IsSearchWidgetFocused() ||
+                !TryGetFocusedTextEditor(rect, out var id, out var editor))
+                return;
+
+            text = text ?? "";
+            if (editor.text != text) {
+                editor.text = text;
+                editor.cursorIndex = Math.Max(0, Math.Min(editor.cursorIndex, text.Length));
+                editor.selectIndex = Math.Max(0, Math.Min(editor.selectIndex, text.Length));
             }
+
+            var target = ObserveEditor(id, editor);
+            if (target.Id == 0)
+                return;
+            UpdateNativeFocus(true);
+
+            var currentEvent = Event.current;
+            ProcessNativeKeyEvent(currentEvent, "text-field-impl");
+            SuppressRawHangulKey(id);
+            if (currentEvent != null && !IsSearchWidgetFocused() &&
+                ProcessNativeTextCharacter(currentEvent, "text-field-impl"))
+                currentEvent.Use();
+
+            var actions = Composition.TakeActions(target, Stopwatch.GetTimestamp());
+            if (actions.Count > 0) {
+                var inserted = DebugLogging ? new StringBuilder() : null;
+                foreach (var action in actions) {
+                    var insertedLength = ApplyAction(editor, int.MaxValue, action, inserted);
+                    CommittedCharacters.Expect(target, action.Text, insertedLength,
+                        Time.frameCount);
+                }
+                text = editor.text;
+                GUI.changed = true;
+                Composition.Focus(target, editor.cursorIndex, editor.selectIndex);
+                if (DebugLogging)
+                    WriteLog("INSERT text-field-impl control=" + id + " text=[" +
+                        Escape(inserted.ToString()) + "] result=[" + Escape(editor.text) +
+                        "] cursor=" + editor.cursorIndex + " select=" + editor.selectIndex +
+                        " pending=" + Composition.PendingCount);
+            }
+            SuppressCommittedCharacter(target, id);
+            LogTextEditor("FIELD impl-before", target, id, text, editor, multiline);
+        }
+
+        private static void AfterTextFieldImpl(Rect rect, string text, GUIStyle style,
+            bool multiline, string __result) {
+            if (_desktopTextFieldDepth > 0 || IsSearchWidgetFocused() ||
+                !TryGetFocusedTextEditor(rect, out var id, out var editor))
+                return;
+
+            var target = ObserveEditor(id, editor);
+            if (target.Id != 0)
+                LogTextEditor("FIELD impl-after", target, id, __result, editor, multiline);
+        }
+
+        private static bool TryGetFocusedTextEditor(Rect position, out int id,
+            out TextEditor editor) {
+            id = GUIUtility.keyboardControl;
+            editor = null;
+            if (id == 0)
+                return false;
+
+            editor = GUIUtility.GetStateObject(typeof(TextEditor), id) as TextEditor;
+            if (editor == null)
+                return false;
+            if (editor.controlID == id && editor.position.Equals(position))
+                return true;
+
+            if (_controlIdForRect == null)
+                return false;
+            try {
+                var rectControl = (int)_controlIdForRect.Invoke(null, new object[] { position });
+                if (rectControl != id)
+                    return false;
+
+                editor = GUIUtility.GetStateObject(typeof(TextEditor), rectControl) as TextEditor;
+                return editor != null && editor.controlID == rectControl;
+            } catch (Exception exception) {
+                if (DebugLogging)
+                    WriteLog("FIELD impl control-id lookup failed " + exception.GetType().Name);
+                editor = null;
+                return false;
+            }
+        }
+
+        private static void LogTextEditor(string stage, ControlToken target, int id, string text,
+            TextEditor editor, bool multiline) {
+            var currentEvent = Event.current;
+            if (!DebugLogging || GUIUtility.keyboardControl != id || currentEvent == null ||
+                (currentEvent.rawType != EventType.KeyDown &&
+                    currentEvent.rawType != EventType.KeyUp))
+                return;
+            WriteLog(stage + " control=" + id + " token=" + target.Id + ":" +
+                target.Generation + " keyboardControl=" + GUIUtility.keyboardControl +
+                " hotControl=" + GUIUtility.hotControl + " text=[" + Escape(text) +
+                "] editor=[" + Escape(editor.text) + "] cursor=" + editor.cursorIndex +
+                " select=" + editor.selectIndex + " multiline=" + multiline + " " +
+                DescribeEvent());
         }
 
         private static void BeforeQuickSearch(QuickSearchWidget __instance, out string __state) {
@@ -605,11 +734,18 @@ namespace FcitxCjkInput {
 
         private static void AfterQuickSearch(QuickSearchWidget __instance, string __state) {
             var focused = __instance.CurrentlyFocused();
+            if (focused && _quickSearchCaretSyncPending) {
+                SyncQuickSearchCaret(_quickSearchFilter, _quickSearchPendingCaret);
+                _quickSearchCaretSyncPending = false;
+                _quickSearchPendingCaret = -1;
+            }
             if (!focused && ReferenceEquals(_quickSearchFilter, __instance.filter)) {
                 SetQuickSearchText(_quickSearchFilter, _quickSearchCommittedText);
                 _quickSearchFilter = null;
                 _quickSearchTarget = default;
                 _quickSearchRenderedText = "";
+                _quickSearchCaretSyncPending = false;
+                _quickSearchPendingCaret = -1;
                 Composition.Blur();
             }
             if (!DebugLogging)
@@ -680,6 +816,7 @@ namespace FcitxCjkInput {
                 return;
 
             var actions = Composition.TakeActions(_quickSearchTarget, Stopwatch.GetTimestamp());
+            var caret = _quickSearchCommittedText.Length;
             foreach (var action in actions) {
                 var start = Math.Max(0, Math.Min(action.SelectionStart,
                     _quickSearchCommittedText.Length));
@@ -687,6 +824,7 @@ namespace FcitxCjkInput {
                     _quickSearchCommittedText.Length));
                 _quickSearchCommittedText = TextEditMath.ReplaceRange(_quickSearchCommittedText,
                     start, end, action.Text);
+                caret = start + action.Text.Length;
                 if (DebugLogging)
                     WriteLog("SEARCH commit token=" + action.Target.Id + ":" +
                         action.Target.Generation + " text=[" + Escape(action.Text) +
@@ -701,15 +839,34 @@ namespace FcitxCjkInput {
                     _quickSearchCommittedText.Length));
                 renderedText = TextEditMath.ReplaceRange(_quickSearchCommittedText, start, end,
                     view.Text);
+                caret = start + Math.Max(0, Math.Min(view.Cursor, view.Text.Length));
             }
             if (renderedText == _quickSearchFilter.Text)
                 return;
 
             SetQuickSearchText(_quickSearchFilter, renderedText);
+            SyncQuickSearchCaret(_quickSearchFilter, caret);
+            _quickSearchCaretSyncPending = true;
+            _quickSearchPendingCaret = caret;
             if (DebugLogging)
                 WriteLog("SEARCH composition display=[" + Escape(renderedText) + "] committed=[" +
                     Escape(_quickSearchCommittedText) + "] preedit=" +
                     Composition.TryGetView(_quickSearchTarget, out _) + " " + DescribeEvent());
+        }
+
+        private static void SyncQuickSearchCaret(QuickSearchFilter filter, int caret) {
+            if (filter == null)
+                return;
+            var control = GUIUtility.keyboardControl;
+            if (control == 0)
+                return;
+            var editor = GUIUtility.GetStateObject(typeof(TextEditor), control) as TextEditor;
+            if (editor == null)
+                return;
+            var text = filter.Text ?? "";
+            editor.text = text;
+            editor.cursorIndex = Math.Max(0, Math.Min(caret, text.Length));
+            editor.selectIndex = editor.cursorIndex;
         }
 
         private static void SetQuickSearchText(QuickSearchFilter filter, string text) {
