@@ -48,6 +48,9 @@ namespace FcitxCjkInput {
         private static readonly List<WaylithRoutedKeyEvent> WaylithRoutedKeyEvents =
             new List<WaylithRoutedKeyEvent>();
 
+        [ThreadStatic]
+        private static WaylithNativeKeyScope _waylithNativeKeyScope;
+
         private static StreamWriter _log;
         private static IntPtr _nativeHandle;
         private static NativeSetDebug _nativeSetDebug;
@@ -61,10 +64,13 @@ namespace FcitxCjkInput {
         private static MethodInfo _waylithCtrlDown;
         private static MethodInfo _waylithAltDown;
         private static MethodInfo _waylithMetaDown;
+        private static MethodInfo _waylithGlfwKeyToInputKey;
+        private static MethodInfo _waylithGlfwGetPlatform;
         private static string _engine = "unknown";
         private static bool _nativeReady;
         private static bool _nativeDirectInputAvailable;
         private static bool _waylithInputKeyPatched;
+        private static bool _waylithGlfwInputKeyPatched;
         private static bool? _nativeFocusState;
         private static long _nativeFocusRetryAt;
         private static bool _nativeLoaded;
@@ -120,6 +126,15 @@ namespace FcitxCjkInput {
             public bool Release;
             public bool Accepted;
             public bool Modifier;
+        }
+
+        private struct WaylithNativeKeyScope {
+            public uint Keycode;
+            public int Scancode;
+            public string KeyName;
+            public string Platform;
+            public bool Down;
+            public bool HasKeycode;
         }
 
         [DllImport("libdl.so.2")]
@@ -244,6 +259,30 @@ namespace FcitxCjkInput {
                     return parameters.Length == 2 && parameters[0].ParameterType.IsEnum &&
                         parameters[1].ParameterType == typeof(bool);
                 });
+            var waylithGlfwInputSource = AccessTools.TypeByName("Waylith.Input.GlfwInputSource");
+            var waylithGlfwKeyMap = AccessTools.TypeByName("Waylith.Input.GlfwKeyMap");
+            var waylithGlfw = AccessTools.TypeByName("Brutal.GlfwApi.Glfw");
+            _waylithGlfwGetPlatform = waylithGlfw?.GetMethod("GetPlatform",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+            _waylithGlfwKeyToInputKey = waylithGlfwKeyMap?.GetMethods(
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+                .FirstOrDefault(method => {
+                    if (method.Name != "ToKey")
+                        return false;
+                    var parameters = method.GetParameters();
+                    return method.IsStatic && parameters.Length == 1 &&
+                        parameters[0].ParameterType.IsEnum;
+                });
+            var waylithGlfwOnKey = waylithGlfwInputSource?.GetMethods(
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+                .FirstOrDefault(method => {
+                    if (method.Name != "OnKey")
+                        return false;
+                    var parameters = method.GetParameters();
+                    return parameters.Length == 5 && parameters[1].ParameterType.IsEnum &&
+                        parameters[2].ParameterType == typeof(int) &&
+                        parameters[3].ParameterType.IsEnum && parameters[4].ParameterType.IsEnum;
+                });
             if (waylithOnKey != null) {
                 _waylithShiftDown = AccessTools.PropertyGetter(waylithInputState, "ShiftDown");
                 _waylithCtrlDown = AccessTools.PropertyGetter(waylithInputState, "CtrlDown");
@@ -253,6 +292,14 @@ namespace FcitxCjkInput {
                     prefix: new HarmonyMethod(typeof(FcitxCjkInputMod),
                         nameof(BeforeWaylithInputKey)));
                 _waylithInputKeyPatched = true;
+            }
+            if (waylithGlfwOnKey != null) {
+                harmony.Patch(waylithGlfwOnKey,
+                    prefix: new HarmonyMethod(typeof(FcitxCjkInputMod),
+                        nameof(BeforeWaylithGlfwInputKey)),
+                    postfix: new HarmonyMethod(typeof(FcitxCjkInputMod),
+                        nameof(AfterWaylithGlfwInputKey)));
+                _waylithGlfwInputKeyPatched = true;
             }
             harmony.Patch(desktopTextField,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeDesktopTextField)),
@@ -280,6 +327,9 @@ namespace FcitxCjkInput {
                 WriteLog("PATCH Root.OnGUI=" + rootOnGui + " textField=" + desktopTextField +
                     " textFieldImpl=" + textFieldImpl +
                     " waylithInputKey=" + (waylithOnKey?.ToString() ?? "unavailable") +
+                    " waylithGlfwInputKey=" +
+                    (waylithGlfwOnKey?.ToString() ?? "unavailable") +
+                    " waylithGlfwInputKeyPatched=" + _waylithGlfwInputKeyPatched +
                     " quickSearch=" + quickSearch + " searchTextSetter=" + searchTextSetter +
                     " keyBindingIsDown=" + keyBindingIsDown + " keyBindingKeyDownEvent=" +
                     keyBindingKeyDownEvent + " playSettingsControls=" + playSettingsControls);
@@ -596,6 +646,61 @@ namespace FcitxCjkInput {
             LogRootEvent(currentEvent, textFieldActive);
         }
 
+        private static void BeforeWaylithGlfwInputKey(object[] __args,
+            out WaylithNativeKeyScope __state) {
+            __state = _waylithNativeKeyScope;
+            _waylithNativeKeyScope = default;
+            if (__args == null || __args.Length < 4 || __args[1] == null ||
+                !(__args[2] is int scancode) || scancode <= 0 || __args[3] == null)
+                return;
+
+            var action = __args[3].ToString();
+            var down = action == "Press" || action == "Repeat";
+            if (!down && action != "Release")
+                return;
+
+            var keyName = __args[1].ToString();
+            if (_waylithGlfwKeyToInputKey != null) {
+                try {
+                    var inputKey = _waylithGlfwKeyToInputKey.Invoke(null,
+                        new[] { __args[1] });
+                    if (inputKey != null)
+                        keyName = inputKey.ToString();
+                } catch {
+                    // Keep the GLFW key name; letter names match Waylith.Input.Key.
+                }
+            }
+
+            var platform = GetWaylithGlfwPlatform();
+            // Wayland's GLFW callback reports wl_keyboard's evdev code. Fcitx clients
+            // use the XKB/native scan-code form, which is evdev code + 8.
+            var keycode = platform == "Wayland" ? unchecked((uint)(scancode + 8)) :
+                unchecked((uint)scancode);
+
+            _waylithNativeKeyScope = new WaylithNativeKeyScope {
+                Keycode = keycode,
+                Scancode = scancode,
+                KeyName = keyName,
+                Platform = platform,
+                Down = down,
+                HasKeycode = true
+            };
+        }
+
+        private static void AfterWaylithGlfwInputKey(WaylithNativeKeyScope __state) {
+            _waylithNativeKeyScope = __state;
+        }
+
+        private static string GetWaylithGlfwPlatform() {
+            if (_waylithGlfwGetPlatform == null)
+                return "unknown";
+            try {
+                return _waylithGlfwGetPlatform.Invoke(null, null)?.ToString() ?? "unknown";
+            } catch {
+                return "unknown";
+            }
+        }
+
         private static bool BeforeWaylithInputKey(object __instance, object[] __args) {
             if (__args == null || __args.Length < 2 || __args[0] == null ||
                 !(__args[1] is bool down))
@@ -622,6 +727,11 @@ namespace FcitxCjkInput {
             }
 
             UpdateNativeFocus(true);
+            var nativeKeyScope = _waylithNativeKeyScope;
+            var hasNativeKeycode = nativeKeyScope.HasKeycode &&
+                string.Equals(nativeKeyScope.KeyName, keyName, StringComparison.Ordinal) &&
+                nativeKeyScope.Down == down;
+            var keycode = hasNativeKeycode ? nativeKeyScope.Keycode : 0u;
             var state = RemoveRightAltSelfState(keyName, WaylithModifierState(__instance));
             var modifier = IsModifierKeysym(keyval);
             var release = !down;
@@ -629,12 +739,13 @@ namespace FcitxCjkInput {
 
             if (down) {
                 var keyDownState = RemoveModifierSelfState(keyval, state);
-                accepted = SendNativeKey(keyval, keyDownState, release: false);
+                accepted = SendNativeKey(keyval, keyDownState, release: false,
+                    keycode: keycode);
                 NativePressedKeys.Add(keyval);
                 if (accepted)
                     NativeConsumedKeys.Add(keyval);
             } else if (NativePressedKeys.Remove(keyval)) {
-                accepted = SendNativeKey(keyval, state, release: true);
+                accepted = SendNativeKey(keyval, state, release: true, keycode: keycode);
                 var consumed = NativeConsumedKeys.Remove(keyval);
                 if (consumed && !modifier)
                     WaylithConsumedKeys.Add(keyval);
@@ -650,7 +761,11 @@ namespace FcitxCjkInput {
 
             if (DebugLogging)
                 WriteLog("FCITX key source=waylith-input-state key=" + keyName +
-                    " keysym=0x" + keyval.ToString("X") + " state=0x" + state.ToString("X") +
+                    " keysym=0x" + keyval.ToString("X") + " keycode=" + keycode +
+                    " scancode=" + (hasNativeKeycode ? nativeKeyScope.Scancode.ToString() : "none") +
+                    " keycode-source=" + (hasNativeKeycode
+                        ? "glfw-" + nativeKeyScope.Platform : "unavailable") +
+                    " state=0x" + state.ToString("X") +
                     " release=" + release + " accepted=" + accepted + " " +
                     DescribeEvent());
 
@@ -1281,10 +1396,11 @@ namespace FcitxCjkInput {
             return false;
         }
 
-        private static bool SendNativeKey(uint keyval, uint state, bool release) {
+        private static bool SendNativeKey(uint keyval, uint state, bool release,
+            uint keycode = 0) {
             if (_nativeProcessKey == null)
                 return false;
-            var result = _nativeProcessKey(keyval, 0, state, release ? 1 : 0,
+            var result = _nativeProcessKey(keyval, keycode, state, release ? 1 : 0,
                 unchecked((uint)Environment.TickCount));
             return result == 1;
         }
