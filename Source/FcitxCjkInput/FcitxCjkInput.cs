@@ -79,6 +79,7 @@ namespace FcitxCjkInput {
         private static long _restartAt;
         private static int _focusedControl;
         private static int _desktopTextFieldHandledDepth;
+        private static int _drawingDesktopTextFieldId;
         private static int _focusedTextFieldFrame = -10;
         private static int _lastZContext;
         private static int _unboundPreeditContext;
@@ -135,6 +136,11 @@ namespace FcitxCjkInput {
             public string Platform;
             public bool Down;
             public bool HasKeycode;
+        }
+
+        private struct DesktopTextFieldScope {
+            public int PreviousDrawingControlId;
+            public bool WasFocused;
         }
 
         [DllImport("libdl.so.2")]
@@ -808,9 +814,13 @@ namespace FcitxCjkInput {
         }
 
         private static void BeforeDesktopTextField(Rect position, int id, GUIContent content,
-            bool multiline, int maxLength, GUIStyle style, out bool __state) {
-            __state = id != 0 && GUIUtility.keyboardControl == id;
-            if (!__state) {
+            bool multiline, int maxLength, GUIStyle style, out DesktopTextFieldScope __state) {
+            __state = new DesktopTextFieldScope {
+                PreviousDrawingControlId = _drawingDesktopTextFieldId,
+                WasFocused = id != 0 && GUIUtility.keyboardControl == id
+            };
+            _drawingDesktopTextFieldId = id;
+            if (!__state.WasFocused) {
                 var focusEvent = Event.current;
                 if (DebugLogging && focusEvent != null &&
                     (focusEvent.rawType == EventType.KeyDown ||
@@ -861,8 +871,9 @@ namespace FcitxCjkInput {
         }
 
         private static void AfterDesktopTextField(Rect position, int id, GUIContent content,
-            bool multiline, int maxLength, GUIStyle style, bool __state) {
-            if (__state)
+            bool multiline, int maxLength, GUIStyle style, DesktopTextFieldScope __state) {
+            _drawingDesktopTextFieldId = __state.PreviousDrawingControlId;
+            if (__state.WasFocused)
                 _desktopTextFieldHandledDepth = Math.Max(0,
                     _desktopTextFieldHandledDepth - 1);
             if (GUIUtility.keyboardControl != id)
@@ -1645,6 +1656,13 @@ namespace FcitxCjkInput {
             if (id == 0) {
                 if (DebugLogging && logEvent)
                     WriteLog("DRAW hook skip=no-keyboard-control " + DescribeEvent());
+                return;
+            }
+            if (_drawingDesktopTextFieldId != id) {
+                if (DebugLogging && logEvent)
+                    WriteLog("DRAW hook skip=other-textfield drawingControl=" +
+                        _drawingDesktopTextFieldId + " focusedControl=" + id + " " +
+                        DescribeEvent());
                 return;
             }
             if (!ControlTokens.TryGetValue(id, out var target)) {
