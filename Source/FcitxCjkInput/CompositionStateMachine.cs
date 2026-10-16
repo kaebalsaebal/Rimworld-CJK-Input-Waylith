@@ -5,17 +5,7 @@ namespace FcitxCjkInput {
     public enum RightAltKeyMode {
         AltRight,
         Hangul,
-        HangulHanja,
-        Kanji,
-        Muhenkan,
-        Henkan,
-        HiraganaKatakana,
         ZenkakuHankaku,
-        KanaLock,
-        KanaShift,
-        EisuShift,
-        EisuToggle,
-        ModeSwitch
     }
 
     internal static class TextEditMath {
@@ -50,17 +40,7 @@ namespace FcitxCjkInput {
         public static uint RightAltKeysym(RightAltKeyMode mode) {
             switch (mode) {
                 case RightAltKeyMode.Hangul: return 0xff31u;
-                case RightAltKeyMode.HangulHanja: return 0xff34u;
-                case RightAltKeyMode.Kanji: return 0xff21u;
-                case RightAltKeyMode.Muhenkan: return 0xff22u;
-                case RightAltKeyMode.Henkan: return 0xff23u;
-                case RightAltKeyMode.HiraganaKatakana: return 0xff27u;
                 case RightAltKeyMode.ZenkakuHankaku: return 0xff2au;
-                case RightAltKeyMode.KanaLock: return 0xff2du;
-                case RightAltKeyMode.KanaShift: return 0xff2eu;
-                case RightAltKeyMode.EisuShift: return 0xff2fu;
-                case RightAltKeyMode.EisuToggle: return 0xff30u;
-                case RightAltKeyMode.ModeSwitch: return 0xff7eu;
                 case RightAltKeyMode.AltRight:
                 default: return 0xffeau;
             }

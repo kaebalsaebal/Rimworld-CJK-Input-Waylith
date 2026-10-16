@@ -1,5 +1,3 @@
-using System;
-using System.Collections.Generic;
 using UnityEngine;
 using Verse;
 
@@ -7,10 +5,16 @@ namespace FcitxCjkInput {
     public sealed class FcitxCjkInputSettings : ModSettings {
         public bool DebugLog;
         public RightAltKeyMode RightAltMode = RightAltKeyMode.AltRight;
+        public bool ForceRightAltHangul;
+        public bool ForceBackquoteEisuToggle;
 
         public override void ExposeData() {
             Scribe_Values.Look(ref DebugLog, "debugLog", false);
             Scribe_Values.Look(ref RightAltMode, "rightAltMode", RightAltKeyMode.AltRight);
+            Scribe_Values.Look(ref ForceRightAltHangul, "forceRightAltHangul",
+                RightAltMode == RightAltKeyMode.Hangul);
+            Scribe_Values.Look(ref ForceBackquoteEisuToggle, "forceBackquoteEisuToggle",
+                RightAltMode == RightAltKeyMode.ZenkakuHankaku);
         }
     }
 
@@ -25,45 +29,34 @@ namespace FcitxCjkInput {
             return "Fcitx CJK Input";
         }
 
-        private static string RightAltModeLabel(RightAltKeyMode mode) {
-            switch (mode) {
-                case RightAltKeyMode.Hangul: return "Hangul (Korean input toggle)";
-                case RightAltKeyMode.HangulHanja: return "HangulHanja (Korean Hanja conversion)";
-                case RightAltKeyMode.Kanji: return "Kanji (Japanese)";
-                case RightAltKeyMode.Muhenkan: return "Muhenkan (Japanese)";
-                case RightAltKeyMode.Henkan: return "Henkan (Japanese conversion)";
-                case RightAltKeyMode.HiraganaKatakana: return "HiraganaKatakana (Japanese)";
-                case RightAltKeyMode.ZenkakuHankaku: return "ZenkakuHankaku (Japanese full/half width)";
-                case RightAltKeyMode.KanaLock: return "KanaLock (Japanese)";
-                case RightAltKeyMode.KanaShift: return "KanaShift (Japanese)";
-                case RightAltKeyMode.EisuShift: return "EisuShift (Japanese alphanumeric)";
-                case RightAltKeyMode.EisuToggle: return "EisuToggle (Japanese alphanumeric)";
-                case RightAltKeyMode.ModeSwitch: return "ModeSwitch (generic)";
-                case RightAltKeyMode.AltRight:
-                default: return "AltRight (standard right Alt)";
-            }
-        }
-
         public override void DoSettingsWindowContents(Rect inRect) {
             var listing = new Listing_Standard();
             listing.Begin(inRect);
             var enabled = Settings.DebugLog;
             listing.CheckboxLabeled("Debug log", ref enabled,
                 "Write verbose IME diagnostics to /tmp/fcitxcjkinput.log.");
-            if (listing.ButtonText("Right Alt mapping: " + RightAltModeLabel(Settings.RightAltMode))) {
-                var options = new List<FloatMenuOption>();
-                foreach (RightAltKeyMode mode in Enum.GetValues(typeof(RightAltKeyMode))) {
-                    var selectedMode = mode;
-                    options.Add(new FloatMenuOption(RightAltModeLabel(selectedMode), () => {
-                        Settings.RightAltMode = selectedMode;
-                        WriteSettings();
-                    }));
-                }
-                Find.WindowStack.Add(new FloatMenu(options));
-            }
-            listing.Label("Select the X11 keysym Fcitx should receive for Right Alt; " +
-                "match this to the key configured in your input method.");
+            var forceRightAltHangul = Settings.ForceRightAltHangul;
+            listing.CheckboxLabeled("Force Right Alt to Hangul toggle",
+                ref forceRightAltHangul,
+                "Send the Hangul keysym (0xFF31) to Fcitx when Right Alt is pressed.");
+            var forceBackquoteEisuToggle = Settings.ForceBackquoteEisuToggle;
+            listing.CheckboxLabeled("Map ` / ~ key to Japanese EisuToggle (0xFF30)",
+                ref forceBackquoteEisuToggle,
+                "Send the EisuToggle keysym (0xFF30) to Fcitx when the backquote key is pressed.");
             listing.End();
+
+            var settingsChanged = false;
+            if (forceRightAltHangul != Settings.ForceRightAltHangul) {
+                Settings.ForceRightAltHangul = forceRightAltHangul;
+                settingsChanged = true;
+            }
+            if (forceBackquoteEisuToggle != Settings.ForceBackquoteEisuToggle) {
+                Settings.ForceBackquoteEisuToggle = forceBackquoteEisuToggle;
+                settingsChanged = true;
+            }
+            if (settingsChanged)
+                WriteSettings();
+
             if (enabled != Settings.DebugLog) {
                 Settings.DebugLog = enabled;
                 WriteSettings();

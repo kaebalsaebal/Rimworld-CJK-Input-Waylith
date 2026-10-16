@@ -1484,7 +1484,9 @@ namespace FcitxCjkInput {
                 case "LeftAlt": keyval = 0xffe9; return true;
                 case "RightAlt":
                     keyval = ImeRouting.RightAltKeysym(
-                        FcitxCjkInputEntry.Settings?.RightAltMode ?? RightAltKeyMode.AltRight);
+                        FcitxCjkInputEntry.Settings?.ForceRightAltHangul == true
+                            ? RightAltKeyMode.Hangul
+                            : RightAltKeyMode.AltRight);
                     return true;
                 case "LeftCommand": keyval = 0xffeb; return true;
                 case "LeftMeta":
@@ -1499,7 +1501,12 @@ namespace FcitxCjkInput {
                 case "ScrollLock": keyval = 0xff14; return true;
                 case "PrintScreen": keyval = 0xff61; return true;
                 case "Pause": keyval = 0xff13; return true;
-                case "Backquote": keyval = 0x60; return true;
+                case "Backquote":
+                    keyval = ImeRouting.RightAltKeysym(
+                        FcitxCjkInputEntry.Settings?.ForceBackquoteEisuToggle == true
+                        ? RightAltKeyMode.ZenkakuHankaku
+                        : RightAltKeyMode.AltRight);
+                    return true;
                 case "Quote": keyval = 0x27; return true;
                 case "Semicolon":
                 case "OEM1": keyval = 0x3b; return true;
@@ -1512,10 +1519,8 @@ namespace FcitxCjkInput {
                 case "RightBracket": keyval = 0x5d; return true;
                 case "Minus": keyval = 0x2d; return true;
                 case "Equals": keyval = 0x3d; return true;
-                case "Hangul":
-                case "Hangeul": keyval = 0xff31; return true;
-                case "HangulHanja":
-                case "Hanja": keyval = 0xff34; return true;
+                case "Hangul": keyval = 0xff31; return true;
+                case "HangulHanja": keyval = 0xff34; return true;
                 case "NumpadDivide": keyval = 0xffaf; return true;
                 case "NumpadMultiply": keyval = 0xffaa; return true;
                 case "NumpadPlus": keyval = 0xffab; return true;
@@ -1549,8 +1554,7 @@ namespace FcitxCjkInput {
 
         private static uint RemoveRightAltSelfState(string keyName, uint state) {
             if (keyName == "RightAlt" &&
-                (FcitxCjkInputEntry.Settings?.RightAltMode ?? RightAltKeyMode.AltRight) !=
-                    RightAltKeyMode.AltRight)
+                FcitxCjkInputEntry.Settings?.ForceRightAltHangul == true)
                 return state & ~((1u << 3) | (1u << 7));
             return state;
         }
