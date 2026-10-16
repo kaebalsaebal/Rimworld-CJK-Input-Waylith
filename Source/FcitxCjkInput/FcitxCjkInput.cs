@@ -1502,10 +1502,10 @@ namespace FcitxCjkInput {
                 case "PrintScreen": keyval = 0xff61; return true;
                 case "Pause": keyval = 0xff13; return true;
                 case "Backquote":
-                    keyval = ImeRouting.RightAltKeysym(
-                        FcitxCjkInputEntry.Settings?.ForceBackquoteEisuToggle == true
-                        ? RightAltKeyMode.ZenkakuHankaku
-                        : RightAltKeyMode.AltRight);
+                    keyval = ImeRouting.BackQuoteKeysym(
+                        FcitxCjkInputEntry.Settings?.ForceBackquoteZenkakuHankaku == true
+                        ? BackQuoteKeyMode.ZenkakuHankaku
+                        : BackQuoteKeyMode.BackQuote);
                     return true;
                 case "Quote": keyval = 0x27; return true;
                 case "Semicolon":

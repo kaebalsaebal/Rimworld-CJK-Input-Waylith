@@ -5,7 +5,11 @@ namespace FcitxCjkInput {
     public enum RightAltKeyMode {
         AltRight,
         Hangul,
+    }
+
+    public enum BackQuoteKeyMode {
         ZenkakuHankaku,
+        BackQuote,
     }
 
     internal static class TextEditMath {
@@ -40,9 +44,15 @@ namespace FcitxCjkInput {
         public static uint RightAltKeysym(RightAltKeyMode mode) {
             switch (mode) {
                 case RightAltKeyMode.Hangul: return 0xff31u;
-                case RightAltKeyMode.ZenkakuHankaku: return 0xff2au;
                 case RightAltKeyMode.AltRight:
                 default: return 0xffeau;
+            }
+        }
+        public static uint BackQuoteKeysym(BackQuoteKeyMode mode) {
+            switch (mode) {
+                case BackQuoteKeyMode.ZenkakuHankaku: return 0xff2au;
+                case BackQuoteKeyMode.BackQuote:
+                default: return 0x60u;
             }
         }
 
