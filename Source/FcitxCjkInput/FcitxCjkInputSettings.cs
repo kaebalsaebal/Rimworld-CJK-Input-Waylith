@@ -42,7 +42,7 @@ namespace FcitxCjkInput {
                 ref forceRightAltHangul,
                 "Send the Hangul keysym (0xFF31) to Fcitx when RightAlt key is pressed.");
             var forceBackquoteZenkakuHankaku = Settings.ForceBackquoteZenkakuHankaku;
-            listing.CheckboxLabeled("Force ~/` key to Japanese convert 半角/全角 key(0xFF2A)",
+            listing.CheckboxLabeled("Force ~/` key to convert 半角/全角 key(0xFF2A) : Not Implemented",
                 ref forceBackquoteZenkakuHankaku,
                 "Send the ZenkakuHankaku keysym (0xFF2A) to Fcitx when the backquote key is pressed.");
             listing.End();
