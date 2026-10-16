@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <ModMetaData>
-  <name>리눅스 Fcitx 한글 입력(1.7 버전)</name>
+  <name>리눅스 Fcitx 한글 입력(1.7 버전) / Linux Fcitx Korean Input Mode(1.7 Forked)</name>
   <author>MaSangChang</author>
   <modVersion>0.0.1</modVersion>
   <packageId>MaSangChang.cjkinputwaylith</packageId>
