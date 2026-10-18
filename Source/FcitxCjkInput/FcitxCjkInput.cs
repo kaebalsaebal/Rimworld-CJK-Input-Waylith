@@ -1217,7 +1217,8 @@ namespace FcitxCjkInput {
 
         private static void SuppressRawImeKey(int id) {
             var currentEvent = Event.current;
-            var letter = IsLatinLetterKey(currentEvent.keyCode);
+            var letter = IsLatinLetterKey(currentEvent.keyCode) ||
+                IsLatinLetterCharacter(currentEvent.character);
             var backspace = currentEvent.keyCode == KeyCode.Backspace;
             if (currentEvent.type != EventType.KeyDown || (!letter && !backspace))
                 return;
@@ -1394,7 +1395,7 @@ namespace FcitxCjkInput {
                     continue;
 
                 var matches = hasEventKey
-                    ? routed.Keyval == keyval
+                    ? routed.Keyval == keyval || IsSameLatinLetterKeysym(routed.Keyval, keyval)
                     : currentEvent.keyCode == KeyCode.None && currentEvent.character == '\0' &&
                         routed.Modifier;
                 if (!matches)
@@ -1405,6 +1406,18 @@ namespace FcitxCjkInput {
                 return true;
             }
             return false;
+        }
+
+        private static bool IsSameLatinLetterKeysym(uint first, uint second) {
+            if (first > 0x7f || second > 0x7f)
+                return false;
+
+            var firstChar = (char)first;
+            var secondChar = (char)second;
+
+            return IsLatinLetterCharacter(firstChar) &&
+                IsLatinLetterCharacter(secondChar) &&
+                char.ToLowerInvariant(firstChar) == char.ToLowerInvariant(secondChar);
         }
 
         private static bool SendNativeKey(uint keyval, uint state, bool release,
@@ -1746,6 +1759,11 @@ namespace FcitxCjkInput {
 
         private static bool IsLatinLetterKey(KeyCode keyCode) {
             return keyCode >= KeyCode.A && keyCode <= KeyCode.Z;
+        }
+
+        private static bool IsLatinLetterCharacter(char character) {
+            return (character >= 'a' && character <= 'z') ||
+                (character >= 'A' && character <= 'Z');
         }
 
         private static string DecodeHex(string hex) {
