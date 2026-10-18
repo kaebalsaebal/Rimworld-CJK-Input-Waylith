@@ -1395,7 +1395,9 @@ namespace FcitxCjkInput {
                     continue;
 
                 var matches = hasEventKey
-                    ? routed.Keyval == keyval || IsSameLatinLetterKeysym(routed.Keyval, keyval)
+                    ? routed.Keyval == keyval ||
+                        IsSameLatinLetterKeysym(routed.Keyval, keyval) ||
+                        IsShiftedAsciiKeyMatch(routed.Keyval, keyval, currentEvent)
                     : currentEvent.keyCode == KeyCode.None && currentEvent.character == '\0' &&
                         routed.Modifier;
                 if (!matches)
@@ -1418,6 +1420,42 @@ namespace FcitxCjkInput {
             return IsLatinLetterCharacter(firstChar) &&
                 IsLatinLetterCharacter(secondChar) &&
                 char.ToLowerInvariant(firstChar) == char.ToLowerInvariant(secondChar);
+        }
+
+        private static bool IsShiftedAsciiKeyMatch(uint routedKeyval, uint eventKeyval, Event currentEvent) {
+            if (currentEvent.keyCode != KeyCode.None ||
+                (currentEvent.modifiers & EventModifiers.Shift) == 0 ||
+                eventKeyval > 0x7f)
+                return false;
+
+            return routedKeyval == UnshiftedAsciiKey(eventKeyval);
+        }
+
+        private static uint UnshiftedAsciiKey(uint keyval) {
+            switch ((char)keyval) {
+                case '!': return '1';
+                case '@': return '2';
+                case '#': return '3';
+                case '$': return '4';
+                case '%': return '5';
+                case '^': return '6';
+                case '&': return '7';
+                case '*': return '8';
+                case '(': return '9';
+                case ')': return '0';
+                case '_': return '-';
+                case '+': return '=';
+                case '{': return '[';
+                case '}': return ']';
+                case '|': return '\\';
+                case ':': return ';';
+                case '"': return '\'';
+                case '<': return ',';
+                case '>': return '.';
+                case '?': return '/';
+                case '~': return '`';
+                default: return keyval;
+            }
         }
 
         private static bool SendNativeKey(uint keyval, uint state, bool release,
