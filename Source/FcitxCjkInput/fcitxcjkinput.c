@@ -1,0 +1,1040 @@
+/*
+ * Native fcitx5 signal bridge loaded in-process by FcitxCjkInput.dll.
+ *
+ * Public API:
+ *   int fcitx_bridge_start(uint32_t rimworld_pid)
+ *   int fcitx_bridge_poll(char *buffer, int capacity)
+ *   int fcitx_bridge_set_focus(int focused)
+ *   int fcitx_bridge_process_key(uint32_t keyval, uint32_t keycode,
+ *       uint32_t state, int release, uint32_t time)
+ *   void fcitx_bridge_stop(void)
+ *
+ * Queue messages:
+ *   READY:<rimworld-pid>
+ *   EVENT:<context-id>:<sequence>:ENGINE:<unique-name>
+ *   EVENT:<context-id>:<sequence>:PREEDIT:<UTF-8 byte cursor>:<UTF-8 hex>
+ *   EVENT:<context-id>:<sequence>:COMMIT:<UTF-8 hex>
+ *   EVENT:<context-id>:<sequence>:FOCUS:IN|OUT
+ *   EVENT:<context-id>:<sequence>:KEY:<ASCII key value>:<release 0|1>:<monotonic ms>
+ *   EVENT:<context-id>:<sequence>:KEYRESET:<reason>
+ *   EVENT:0:0:RESET:<reason>
+ *   STOPPED
+ *   LOG:<diagnostic>
+ *   ERROR:<diagnostic>
+ */
+
+#include <dbus/dbus.h>
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#define EXPORT __attribute__((visibility("default")))
+#define FCITX_SERVICE "org.fcitx.Fcitx5"
+#define FCITX_INPUT_METHOD_PATH "/org/freedesktop/portal/inputmethod"
+#define FCITX_INPUT_METHOD_INTERFACE "org.fcitx.Fcitx.InputMethod1"
+#define INPUT_CONTEXT_INTERFACE "org.fcitx.Fcitx.InputContext1"
+#define MAX_TEXT 4096
+#define MAX_MESSAGE 16384
+#define MAX_DESTINATIONS 16
+#define MAX_CONTEXTS 64
+#define MAX_PENDING_KEYS 128
+#define MAX_QUEUE_MESSAGES 512
+
+struct context_entry {
+    char destination[128];
+    char path[256];
+    int ime_active;
+};
+
+struct pending_key {
+    char client[128];
+    uint32_t serial;
+    uint32_t context;
+    uint32_t keyval;
+    uint32_t keycode;
+    uint32_t state;
+    dbus_bool_t release;
+    uint64_t observed_at_ms;
+    int recover;
+    int canceled;
+};
+
+struct message_node {
+    char *text;
+    struct message_node *next;
+};
+
+static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct message_node *queue_head;
+static struct message_node *queue_tail;
+static size_t queue_count;
+static pthread_t worker_thread;
+static int worker_created;
+static int dbus_threads_ready;
+static atomic_int running;
+static atomic_int debug_logging;
+static atomic_int restart_requested;
+static atomic_int queue_desynced;
+static uint32_t rimworld_pid;
+
+static DBusConnection *connection;
+static DBusConnection *input_connection;
+static char input_destination[128];
+static char input_context_path[256];
+static atomic_int input_context_ready;
+static char rimworld_destinations[MAX_DESTINATIONS][128];
+static size_t rimworld_destination_count;
+static struct context_entry contexts[MAX_CONTEXTS];
+static size_t context_count;
+static uint64_t next_sequence;
+static struct pending_key pending_keys[MAX_PENDING_KEYS];
+static size_t next_pending_key;
+
+static void mark_queue_desynced(void) {
+    pthread_mutex_lock(&queue_mutex);
+    atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
+    pthread_mutex_unlock(&queue_mutex);
+}
+
+static struct message_node *create_message_node(const char *text) {
+    struct message_node *node = malloc(sizeof(*node));
+    if (!node) return NULL;
+    node->text = strdup(text);
+    if (!node->text) {
+        free(node);
+        return NULL;
+    }
+    node->next = NULL;
+    return node;
+}
+
+static void enqueue_message(const char *format, ...) {
+    const int log_message = strncmp(format, "LOG:", 4) == 0;
+    if (!atomic_load_explicit(&debug_logging, memory_order_relaxed) && log_message)
+        return;
+
+    char buffer[MAX_MESSAGE];
+    va_list args;
+    va_start(args, format);
+    const int length = vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    if (length <= 0 || (size_t)length >= sizeof(buffer)) {
+        if (!log_message)
+            mark_queue_desynced();
+        return;
+    }
+
+    struct message_node *node = create_message_node(buffer);
+    if (!node) {
+        if (!log_message)
+            mark_queue_desynced();
+        return;
+    }
+
+    pthread_mutex_lock(&queue_mutex);
+    if (queue_count >= MAX_QUEUE_MESSAGES) {
+        if (!log_message)
+            atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
+        pthread_mutex_unlock(&queue_mutex);
+        free(node->text);
+        free(node);
+        return;
+    }
+    if (queue_tail) queue_tail->next = node;
+    else queue_head = node;
+    queue_tail = node;
+    queue_count++;
+    pthread_mutex_unlock(&queue_mutex);
+}
+
+static void enqueue_hex(const char *prefix, const char *text) {
+    static const char digits[] = "0123456789ABCDEF";
+    const size_t prefix_length = strlen(prefix);
+    const size_t text_length = strlen(text);
+    const size_t length = prefix_length + 1 + text_length * 2;
+    char *message = malloc(length + 1);
+    if (!message) {
+        mark_queue_desynced();
+        return;
+    }
+
+    memcpy(message, prefix, prefix_length);
+    message[prefix_length] = ':';
+    for (size_t i = 0; i < text_length; i++) {
+        const unsigned char byte = (unsigned char)text[i];
+        message[prefix_length + 1 + i * 2] = digits[byte >> 4];
+        message[prefix_length + 2 + i * 2] = digits[byte & 0x0f];
+    }
+    message[length] = '\0';
+    enqueue_message("%s", message);
+    free(message);
+}
+
+static uint32_t connection_pid(const char *name) {
+    DBusMessage *request = dbus_message_new_method_call(
+        DBUS_SERVICE_DBUS, DBUS_PATH_DBUS, DBUS_INTERFACE_DBUS,
+        "GetConnectionUnixProcessID");
+    if (!request) return 0;
+    dbus_message_append_args(request, DBUS_TYPE_STRING, &name, DBUS_TYPE_INVALID);
+
+    DBusError error;
+    dbus_error_init(&error);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(
+        connection, request, 1000, &error);
+    dbus_message_unref(request);
+    if (!reply) {
+        enqueue_message("ERROR:pid lookup destination=%s error=%s", name,
+            dbus_error_is_set(&error) ? error.message : "no reply");
+        dbus_error_free(&error);
+        return 0;
+    }
+
+    uint32_t pid = 0;
+    if (!dbus_message_get_args(reply, &error, DBUS_TYPE_UINT32, &pid,
+            DBUS_TYPE_INVALID)) {
+        enqueue_message("ERROR:pid reply destination=%s error=%s", name,
+            dbus_error_is_set(&error) ? error.message : "invalid reply");
+        dbus_error_free(&error);
+    }
+    dbus_message_unref(reply);
+    return pid;
+}
+
+static int discover_rimworld_destinations(void) {
+    DBusMessage *request = dbus_message_new_method_call(
+        DBUS_SERVICE_DBUS, DBUS_PATH_DBUS, DBUS_INTERFACE_DBUS, "ListNames");
+    if (!request) return 0;
+
+    DBusError error;
+    dbus_error_init(&error);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(
+        connection, request, 1000, &error);
+    dbus_message_unref(request);
+    if (!reply) {
+        enqueue_message("ERROR:ListNames error=%s",
+            dbus_error_is_set(&error) ? error.message : "no reply");
+        dbus_error_free(&error);
+        return 0;
+    }
+
+    DBusMessageIter root;
+    if (!dbus_message_iter_init(reply, &root) ||
+        dbus_message_iter_get_arg_type(&root) != DBUS_TYPE_ARRAY) {
+        dbus_message_unref(reply);
+        return 0;
+    }
+
+    rimworld_destination_count = 0;
+    DBusMessageIter names;
+    dbus_message_iter_recurse(&root, &names);
+    while (dbus_message_iter_get_arg_type(&names) == DBUS_TYPE_STRING &&
+        rimworld_destination_count < MAX_DESTINATIONS) {
+        const char *name = "";
+        dbus_message_iter_get_basic(&names, &name);
+        if (name[0] == ':' && connection_pid(name) == rimworld_pid) {
+            snprintf(rimworld_destinations[rimworld_destination_count],
+                sizeof(rimworld_destinations[0]), "%s", name);
+            enqueue_message("LOG:target destination=%s pid=%u", name, rimworld_pid);
+            rimworld_destination_count++;
+        }
+        dbus_message_iter_next(&names);
+    }
+    dbus_message_unref(reply);
+    return rimworld_destination_count > 0;
+}
+
+static int become_monitor(void) {
+    DBusMessage *request = dbus_message_new_method_call(
+        DBUS_SERVICE_DBUS, DBUS_PATH_DBUS, "org.freedesktop.DBus.Monitoring",
+        "BecomeMonitor");
+    if (!request) return 0;
+
+    DBusMessageIter root;
+    DBusMessageIter rules;
+    dbus_message_iter_init_append(request, &root);
+    dbus_message_iter_open_container(&root, DBUS_TYPE_ARRAY, "s", &rules);
+    char rule_buffer[256];
+    for (size_t i = 0; i < rimworld_destination_count; i++) {
+        snprintf(rule_buffer, sizeof(rule_buffer),
+            "type='signal',interface='org.fcitx.Fcitx.InputContext1',destination='%.127s'",
+            rimworld_destinations[i]);
+        const char *rule = rule_buffer;
+        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
+        snprintf(rule_buffer, sizeof(rule_buffer),
+            "type='method_call',interface='org.fcitx.Fcitx.InputContext1',member='FocusIn',sender='%.127s'",
+            rimworld_destinations[i]);
+        rule = rule_buffer;
+        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
+        snprintf(rule_buffer, sizeof(rule_buffer),
+            "type='method_call',interface='org.fcitx.Fcitx.InputContext1',member='ProcessKeyEvent',sender='%.127s'",
+            rimworld_destinations[i]);
+        rule = rule_buffer;
+        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
+        snprintf(rule_buffer, sizeof(rule_buffer),
+            "type='method_return',destination='%.127s'", rimworld_destinations[i]);
+        rule = rule_buffer;
+        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
+        snprintf(rule_buffer, sizeof(rule_buffer),
+            "type='error',destination='%.127s'", rimworld_destinations[i]);
+        rule = rule_buffer;
+        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
+    }
+    dbus_message_iter_close_container(&root, &rules);
+    uint32_t flags = 0;
+    dbus_message_iter_append_basic(&root, DBUS_TYPE_UINT32, &flags);
+
+    DBusError error;
+    dbus_error_init(&error);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(
+        connection, request, 1000, &error);
+    dbus_message_unref(request);
+    if (!reply) {
+        enqueue_message("ERROR:BecomeMonitor error=%s",
+            dbus_error_is_set(&error) ? error.message : "no reply");
+        dbus_error_free(&error);
+        return 0;
+    }
+    dbus_message_unref(reply);
+    return 1;
+}
+
+static const char *client_name(DBusMessage *message) {
+    return dbus_message_get_type(message) == DBUS_MESSAGE_TYPE_SIGNAL
+        ? dbus_message_get_destination(message)
+        : dbus_message_get_sender(message);
+}
+
+static int is_rimworld_destination(const char *client) {
+    if (!client || client[0] != ':') return 0;
+    if (input_destination[0] && strcmp(input_destination, client) == 0) return 1;
+    for (size_t i = 0; i < rimworld_destination_count; i++) {
+        if (strcmp(client, rimworld_destinations[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+static int is_rimworld_message(DBusMessage *message) {
+    return is_rimworld_destination(client_name(message));
+}
+
+static int is_direct_input_context_message(DBusMessage *message) {
+    const char *path = dbus_message_get_path(message);
+    return path && input_context_path[0] && strcmp(path, input_context_path) == 0;
+}
+
+static uint32_t context_id(DBusMessage *message) {
+    const char *client = client_name(message);
+    const char *path = dbus_message_get_path(message);
+    if (!client || !path) return 0;
+
+    for (size_t i = 0; i < context_count; i++) {
+        if (strcmp(contexts[i].destination, client) == 0 &&
+            strcmp(contexts[i].path, path) == 0)
+            return (uint32_t)(i + 1);
+    }
+    if (context_count >= MAX_CONTEXTS) return 0;
+
+    struct context_entry *entry = &contexts[context_count++];
+    snprintf(entry->destination, sizeof(entry->destination), "%s", client);
+    snprintf(entry->path, sizeof(entry->path), "%s", path);
+    entry->ime_active = 0;
+    enqueue_message("LOG:context id=%zu destination=%s path=%s",
+        context_count, client, path);
+    return (uint32_t)context_count;
+}
+
+static int read_string(DBusMessage *message, char *buffer, size_t size) {
+    DBusError error;
+    dbus_error_init(&error);
+    const char *text = "";
+    if (!dbus_message_get_args(message, &error, DBUS_TYPE_STRING, &text,
+            DBUS_TYPE_INVALID)) {
+        enqueue_message("ERROR:string parse member=%s error=%s",
+            dbus_message_get_member(message),
+            dbus_error_is_set(&error) ? error.message : "invalid signal");
+        dbus_error_free(&error);
+        return 0;
+    }
+    snprintf(buffer, size, "%s", text);
+    return 1;
+}
+
+static int read_preedit(DBusMessage *message, char *buffer, size_t size,
+    int32_t *cursor) {
+    DBusMessageIter root;
+    if (!dbus_message_iter_init(message, &root) ||
+        dbus_message_iter_get_arg_type(&root) != DBUS_TYPE_ARRAY)
+        return 0;
+
+    buffer[0] = '\0';
+    size_t used = 0;
+    DBusMessageIter array;
+    dbus_message_iter_recurse(&root, &array);
+    while (dbus_message_iter_get_arg_type(&array) == DBUS_TYPE_STRUCT) {
+        DBusMessageIter entry;
+        dbus_message_iter_recurse(&array, &entry);
+        if (dbus_message_iter_get_arg_type(&entry) == DBUS_TYPE_STRING) {
+            const char *part = "";
+            dbus_message_iter_get_basic(&entry, &part);
+            const size_t part_length = strlen(part);
+            if (part_length >= size - used) return 0;
+            memcpy(buffer + used, part, part_length);
+            used += part_length;
+            buffer[used] = '\0';
+        }
+        dbus_message_iter_next(&array);
+    }
+
+    if (!dbus_message_iter_next(&root) ||
+        dbus_message_iter_get_arg_type(&root) != DBUS_TYPE_INT32)
+        return 0;
+    dbus_message_iter_get_basic(&root, cursor);
+    return 1;
+}
+
+static uint64_t monotonic_millis(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+
+static int is_recoverable_key(uint32_t keyval) {
+    return keyval == 'a' || keyval == 'A' || keyval == 'd' || keyval == 'D' ||
+        keyval == 's' || keyval == 'S' || keyval == 'w' || keyval == 'W' ||
+        keyval == 'q' || keyval == 'Q' || keyval == 'e' || keyval == 'E' ||
+        keyval == 'z' || keyval == 'Z';
+}
+
+static int is_ime_engine(const char *unique_name) {
+    return unique_name && unique_name[0] && strcmp(unique_name, "unknown") != 0 &&
+        strncmp(unique_name, "keyboard", 8) != 0;
+}
+
+static struct pending_key *find_pending_key(const char *client, uint32_t serial) {
+    for (size_t i = 0; i < MAX_PENDING_KEYS; i++) {
+        if (pending_keys[i].serial == serial &&
+            strcmp(pending_keys[i].client, client) == 0)
+            return &pending_keys[i];
+    }
+    return NULL;
+}
+
+static void cancel_pending_key(uint32_t context, uint32_t keycode) {
+    for (size_t i = 0; i < MAX_PENDING_KEYS; i++) {
+        if (pending_keys[i].serial != 0 && pending_keys[i].recover &&
+            pending_keys[i].context == context && pending_keys[i].keycode == keycode)
+            pending_keys[i].canceled = 1;
+    }
+}
+
+static void cancel_pending_context(uint32_t context) {
+    for (size_t i = 0; i < MAX_PENDING_KEYS; i++) {
+        if (pending_keys[i].serial != 0 && pending_keys[i].context == context)
+            pending_keys[i].canceled = 1;
+    }
+}
+
+static struct pending_key *reserve_pending_key(uint32_t context,
+    unsigned long long sequence) {
+    for (size_t i = 0; i < MAX_PENDING_KEYS; i++) {
+        struct pending_key *pending =
+            &pending_keys[next_pending_key++ % MAX_PENDING_KEYS];
+        if (pending->serial == 0) return pending;
+    }
+    memset(pending_keys, 0, sizeof(pending_keys));
+    next_pending_key = 0;
+    enqueue_message("EVENT:%u:%llu:KEYRESET:pending-overflow", context, sequence);
+    return &pending_keys[next_pending_key++];
+}
+
+static void handle_process_key(DBusMessage *message, uint32_t context,
+    unsigned long long sequence) {
+    DBusError error;
+    dbus_error_init(&error);
+    uint32_t keyval = 0;
+    uint32_t keycode = 0;
+    uint32_t state = 0;
+    dbus_bool_t release = FALSE;
+    uint32_t time = 0;
+    if (!dbus_message_get_args(message, &error,
+            DBUS_TYPE_UINT32, &keyval,
+            DBUS_TYPE_UINT32, &keycode,
+            DBUS_TYPE_UINT32, &state,
+            DBUS_TYPE_BOOLEAN, &release,
+            DBUS_TYPE_UINT32, &time,
+            DBUS_TYPE_INVALID)) {
+        enqueue_message("ERROR:ProcessKeyEvent context=%u error=%s", context,
+            dbus_error_is_set(&error) ? error.message : "invalid signal");
+        dbus_error_free(&error);
+        return;
+    }
+    const uint64_t observed_at_ms = monotonic_millis();
+    const int recoverable = contexts[context - 1].ime_active &&
+        is_recoverable_key(keyval);
+    if (recoverable && release) {
+        cancel_pending_key(context, keycode);
+        enqueue_message("EVENT:%u:%llu:KEY:%u:1:%llu", context, sequence, keyval,
+            (unsigned long long)observed_at_ms);
+    }
+
+    const int debug = atomic_load_explicit(&debug_logging, memory_order_relaxed);
+    const int recover = recoverable && !release;
+    const uint32_t serial = dbus_message_get_serial(message);
+    if (debug || recover) {
+        struct pending_key *pending = reserve_pending_key(context, sequence);
+        snprintf(pending->client, sizeof(pending->client), "%s", client_name(message));
+        pending->serial = serial;
+        pending->context = context;
+        pending->keyval = keyval;
+        pending->keycode = keycode;
+        pending->state = state;
+        pending->release = release;
+        pending->observed_at_ms = observed_at_ms;
+        pending->recover = recover;
+        pending->canceled = 0;
+    }
+    enqueue_message("LOG:ProcessKeyEvent serial=%u context=%u keyval=%u keycode=%u state=%u release=%d time=%u ime_active=%d recover=%d",
+        serial, context, keyval, keycode, state, release, time,
+        contexts[context - 1].ime_active, recover);
+}
+
+static void handle_process_key_reply(DBusMessage *message,
+    unsigned long long sequence) {
+    if (!is_rimworld_destination(dbus_message_get_destination(message))) return;
+    const char *client = dbus_message_get_destination(message);
+    const uint32_t reply_serial = dbus_message_get_reply_serial(message);
+    struct pending_key *pending = find_pending_key(client, reply_serial);
+    if (!pending) return;
+
+    if (dbus_message_get_type(message) == DBUS_MESSAGE_TYPE_ERROR) {
+        enqueue_message("LOG:ProcessKeyReply serial=%u context=%u keyval=%u keycode=%u release=%d recover=%d canceled=%d error=%s",
+            reply_serial, pending->context, pending->keyval, pending->keycode,
+            pending->release, pending->recover, pending->canceled,
+            dbus_message_get_error_name(message));
+        pending->serial = 0;
+        return;
+    }
+
+    DBusError error;
+    dbus_error_init(&error);
+    dbus_bool_t accepted = FALSE;
+    if (dbus_message_get_args(message, &error, DBUS_TYPE_BOOLEAN, &accepted,
+            DBUS_TYPE_INVALID)) {
+        if (pending->recover && !pending->canceled && accepted)
+            enqueue_message("EVENT:%u:%llu:KEY:%u:0:%llu", pending->context, sequence,
+                pending->keyval, (unsigned long long)pending->observed_at_ms);
+        enqueue_message("LOG:ProcessKeyReply serial=%u context=%u keyval=%u keycode=%u state=%u release=%d accepted=%d recover=%d canceled=%d",
+            reply_serial, pending->context, pending->keyval, pending->keycode,
+            pending->state, pending->release, accepted, pending->recover,
+            pending->canceled);
+    } else {
+        enqueue_message("ERROR:ProcessKeyReply serial=%u context=%u error=%s",
+            reply_serial, pending->context,
+            dbus_error_is_set(&error) ? error.message : "invalid reply");
+        dbus_error_free(&error);
+    }
+    pending->serial = 0;
+}
+
+static void handle_message(DBusMessage *message, int from_input_connection) {
+    const int direct_context_ready = atomic_load_explicit(&input_context_ready,
+        memory_order_relaxed);
+    /*
+     * The monitor connection sees the same D-Bus traffic as the direct client
+     * connection. Once we own an input context, process its signals only from
+     * that client connection or preedit/commit events would be queued twice.
+     */
+    if (direct_context_ready && (!from_input_connection ||
+        !is_direct_input_context_message(message)))
+        return;
+    const int type = dbus_message_get_type(message);
+    if (type == DBUS_MESSAGE_TYPE_METHOD_RETURN || type == DBUS_MESSAGE_TYPE_ERROR) {
+        handle_process_key_reply(message, ++next_sequence);
+        return;
+    }
+    if (!dbus_message_has_interface(message, INPUT_CONTEXT_INTERFACE) ||
+        !is_rimworld_message(message))
+        return;
+
+    const char *member = dbus_message_get_member(message);
+    const uint32_t context = context_id(message);
+    if (!member || context == 0) return;
+    const unsigned long long sequence = ++next_sequence;
+    if (dbus_message_get_type(message) == DBUS_MESSAGE_TYPE_METHOD_CALL) {
+        if (strcmp(member, "FocusIn") == 0) {
+            enqueue_message("LOG:FocusIn context=%u", context);
+            enqueue_message("EVENT:%u:%llu:FOCUS:IN", context, sequence);
+        } else if (strcmp(member, "ProcessKeyEvent") == 0) {
+            handle_process_key(message, context, sequence);
+        }
+        return;
+    }
+    if (dbus_message_get_type(message) != DBUS_MESSAGE_TYPE_SIGNAL) return;
+
+    if (strcmp(member, "CurrentIM") == 0) {
+        DBusError error;
+        dbus_error_init(&error);
+        const char *name = "";
+        const char *unique_name = "";
+        const char *language = "";
+        if (dbus_message_get_args(message, &error,
+                DBUS_TYPE_STRING, &name,
+                DBUS_TYPE_STRING, &unique_name,
+                DBUS_TYPE_STRING, &language,
+                DBUS_TYPE_INVALID)) {
+            const int ime_active = is_ime_engine(unique_name);
+            if (!ime_active)
+                cancel_pending_context(context);
+            contexts[context - 1].ime_active = ime_active;
+            enqueue_message("LOG:CurrentIM context=%u name=%s unique=%s lang=%s",
+                context, name, unique_name, language);
+            enqueue_message("EVENT:%u:%llu:ENGINE:%s", context, sequence, unique_name);
+        } else {
+            enqueue_message("ERROR:CurrentIM context=%u error=%s", context,
+                dbus_error_is_set(&error) ? error.message : "invalid signal");
+            dbus_error_free(&error);
+        }
+    } else if (strcmp(member, "CommitString") == 0) {
+        char text[MAX_TEXT];
+        if (read_string(message, text, sizeof(text))) {
+            enqueue_message("LOG:CommitString context=%u bytes=%zu text=%s",
+                context, strlen(text), text);
+            char prefix[96];
+            snprintf(prefix, sizeof(prefix), "EVENT:%u:%llu:COMMIT",
+                context, sequence);
+            enqueue_hex(prefix, text);
+        }
+    } else if (strcmp(member, "UpdateFormattedPreedit") == 0) {
+        char text[MAX_TEXT];
+        int32_t cursor = 0;
+        if (read_preedit(message, text, sizeof(text), &cursor)) {
+            enqueue_message("LOG:Preedit context=%u cursor=%d bytes=%zu text=%s",
+                context, cursor, strlen(text), text);
+            char prefix[96];
+            snprintf(prefix, sizeof(prefix), "EVENT:%u:%llu:%s:%d",
+                context, sequence, "PREEDIT", cursor);
+            enqueue_hex(prefix, text);
+        } else {
+            enqueue_message("ERROR:Preedit context=%u parse failed", context);
+        }
+    } else if (strcmp(member, "NotifyFocusOut") == 0) {
+        cancel_pending_context(context);
+        enqueue_message("LOG:NotifyFocusOut context=%u", context);
+        enqueue_message("EVENT:%u:%llu:FOCUS:OUT", context, sequence);
+    }
+}
+
+static void close_connection(void) {
+    if (!connection) return;
+    dbus_connection_close(connection);
+    dbus_connection_unref(connection);
+    connection = NULL;
+}
+
+static DBusMessage *call_input_context(const char *member, DBusMessage *request,
+    int timeout_ms, DBusError *error) {
+    if (!input_connection || !input_context_path[0]) return NULL;
+    if (!request) return NULL;
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(
+        input_connection, request, timeout_ms, error);
+    dbus_message_unref(request);
+    if (!reply)
+        enqueue_message("ERROR:input context member=%s error=%s", member,
+            dbus_error_is_set(error) ? error->message : "no reply");
+    return reply;
+}
+
+static int send_input_context_noargs(const char *member, int timeout_ms) {
+    DBusMessage *request = dbus_message_new_method_call(FCITX_SERVICE,
+        input_context_path, INPUT_CONTEXT_INTERFACE, member);
+    if (!request) return 0;
+    DBusError error;
+    dbus_error_init(&error);
+    DBusMessage *reply = call_input_context(member, request, timeout_ms, &error);
+    if (!reply) {
+        dbus_error_free(&error);
+        return 0;
+    }
+    dbus_message_unref(reply);
+    dbus_error_free(&error);
+    return 1;
+}
+
+static int create_input_context(void) {
+    DBusError error;
+    dbus_error_init(&error);
+    input_connection = dbus_bus_get_private(DBUS_BUS_SESSION, &error);
+    if (!input_connection) {
+        enqueue_message("ERROR:input session bus error=%s",
+            dbus_error_is_set(&error) ? error.message : "unknown");
+        dbus_error_free(&error);
+        return 0;
+    }
+    dbus_connection_set_exit_on_disconnect(input_connection, FALSE);
+    const char *unique_name = dbus_bus_get_unique_name(input_connection);
+    if (!unique_name || unique_name[0] != ':') {
+        enqueue_message("ERROR:input connection has no unique bus name");
+        dbus_error_free(&error);
+        return 0;
+    }
+    snprintf(input_destination, sizeof(input_destination), "%s", unique_name);
+
+    DBusMessage *request = dbus_message_new_method_call(FCITX_SERVICE,
+        FCITX_INPUT_METHOD_PATH, FCITX_INPUT_METHOD_INTERFACE, "CreateInputContext");
+    if (!request) {
+        dbus_error_free(&error);
+        return 0;
+    }
+    DBusMessageIter root;
+    DBusMessageIter attributes;
+    dbus_message_iter_init_append(request, &root);
+    if (!dbus_message_iter_open_container(&root, DBUS_TYPE_ARRAY, "(ss)", &attributes)) {
+        dbus_message_unref(request);
+        dbus_error_free(&error);
+        return 0;
+    }
+
+    const char *display = getenv("WAYLAND_DISPLAY");
+    if (!display || !display[0]) display = getenv("DISPLAY");
+    if (!display || !display[0]) display = "rimworld-waylith";
+    const char *attribute_name = "display";
+    DBusMessageIter display_pair;
+    dbus_message_iter_open_container(&attributes, DBUS_TYPE_STRUCT, NULL, &display_pair);
+    dbus_message_iter_append_basic(&display_pair, DBUS_TYPE_STRING, &attribute_name);
+    dbus_message_iter_append_basic(&display_pair, DBUS_TYPE_STRING, &display);
+    dbus_message_iter_close_container(&attributes, &display_pair);
+    attribute_name = "program";
+    const char *program = "RimWorld-Waylith";
+    DBusMessageIter program_pair;
+    dbus_message_iter_open_container(&attributes, DBUS_TYPE_STRUCT, NULL, &program_pair);
+    dbus_message_iter_append_basic(&program_pair, DBUS_TYPE_STRING, &attribute_name);
+    dbus_message_iter_append_basic(&program_pair, DBUS_TYPE_STRING, &program);
+    dbus_message_iter_close_container(&attributes, &program_pair);
+    dbus_message_iter_close_container(&root, &attributes);
+
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(
+        input_connection, request, 1000, &error);
+    dbus_message_unref(request);
+    if (!reply) {
+        enqueue_message("ERROR:CreateInputContext error=%s",
+            dbus_error_is_set(&error) ? error.message : "no reply");
+        dbus_error_free(&error);
+        return 0;
+    }
+    DBusMessageIter result;
+    if (!dbus_message_iter_init(reply, &result) ||
+        dbus_message_iter_get_arg_type(&result) != DBUS_TYPE_OBJECT_PATH) {
+        enqueue_message("ERROR:CreateInputContext invalid reply signature");
+        dbus_message_unref(reply);
+        dbus_error_free(&error);
+        return 0;
+    }
+    const char *path = NULL;
+    dbus_message_iter_get_basic(&result, &path);
+    snprintf(input_context_path, sizeof(input_context_path), "%s", path ? path : "");
+    dbus_message_unref(reply);
+    if (!input_context_path[0]) {
+        enqueue_message("ERROR:CreateInputContext returned an empty path");
+        dbus_error_free(&error);
+        return 0;
+    }
+
+    char rule[512];
+    snprintf(rule, sizeof(rule),
+        "type='signal',sender='%s',path='%s',interface='%s'",
+        FCITX_SERVICE, input_context_path, INPUT_CONTEXT_INTERFACE);
+    dbus_bus_add_match(input_connection, rule, &error);
+    if (dbus_error_is_set(&error)) {
+        enqueue_message("ERROR:AddMatch input context error=%s", error.message);
+        dbus_error_free(&error);
+        return 0;
+    }
+    dbus_connection_flush(input_connection);
+
+    pthread_mutex_lock(&input_mutex);
+    DBusMessage *capability_request = dbus_message_new_method_call(FCITX_SERVICE,
+        input_context_path, INPUT_CONTEXT_INTERFACE, "SetCapability");
+    if (capability_request) {
+        const uint64_t capabilities = (UINT64_C(1) << 1) | (UINT64_C(1) << 4) |
+            (UINT64_C(1) << 5) | (UINT64_C(1) << 23) | (UINT64_C(1) << 37) |
+            (UINT64_C(1) << 38);
+        dbus_message_append_args(capability_request, DBUS_TYPE_UINT64, &capabilities,
+            DBUS_TYPE_INVALID);
+        DBusMessage *capability_reply = dbus_connection_send_with_reply_and_block(
+            input_connection, capability_request, 1000, &error);
+        dbus_message_unref(capability_request);
+        if (!capability_reply) {
+            enqueue_message("ERROR:SetCapability error=%s",
+                dbus_error_is_set(&error) ? error.message : "no reply");
+            pthread_mutex_unlock(&input_mutex);
+            dbus_error_free(&error);
+            return 0;
+        }
+        dbus_message_unref(capability_reply);
+    }
+    pthread_mutex_unlock(&input_mutex);
+    dbus_error_free(&error);
+
+    atomic_store_explicit(&input_context_ready, 1, memory_order_relaxed);
+    enqueue_message("LOG:input context ready destination=%s path=%s display=%s",
+        input_destination, input_context_path, display);
+    return 1;
+}
+
+static void close_input_connection(void) {
+    pthread_mutex_lock(&input_mutex);
+    atomic_store_explicit(&input_context_ready, 0, memory_order_relaxed);
+    if (input_connection && input_context_path[0]) {
+        send_input_context_noargs("FocusOut", 200);
+        send_input_context_noargs("DestroyIC", 200);
+    }
+    if (input_connection) {
+        dbus_connection_close(input_connection);
+        dbus_connection_unref(input_connection);
+        input_connection = NULL;
+    }
+    input_context_path[0] = '\0';
+    input_destination[0] = '\0';
+    pthread_mutex_unlock(&input_mutex);
+}
+
+static int pump_input_connection(void) {
+    DBusMessage *messages[32];
+    size_t count = 0;
+    pthread_mutex_lock(&input_mutex);
+    const int connected = input_connection && dbus_connection_read_write(input_connection, 10);
+    if (connected) {
+        while (count < sizeof(messages) / sizeof(messages[0])) {
+            DBusMessage *message = dbus_connection_pop_message(input_connection);
+            if (!message) break;
+            messages[count++] = message;
+        }
+    }
+    pthread_mutex_unlock(&input_mutex);
+    for (size_t i = 0; i < count; i++) {
+        handle_message(messages[i], 1);
+        dbus_message_unref(messages[i]);
+    }
+    return connected;
+}
+
+EXPORT int fcitx_bridge_set_focus(int focused) {
+    if (!atomic_load_explicit(&input_context_ready, memory_order_relaxed)) return ENOTCONN;
+    pthread_mutex_lock(&input_mutex);
+    const int result = send_input_context_noargs(focused ? "FocusIn" : "FocusOut", 250);
+    pthread_mutex_unlock(&input_mutex);
+    if (result)
+        enqueue_message("LOG:input focus %s", focused ? "in" : "out");
+    return result ? 0 : EIO;
+}
+
+EXPORT int fcitx_bridge_process_key(uint32_t keyval, uint32_t keycode,
+    uint32_t state, int release, uint32_t time) {
+    if (!atomic_load_explicit(&input_context_ready, memory_order_relaxed)) return -1;
+    pthread_mutex_lock(&input_mutex);
+    DBusMessage *request = dbus_message_new_method_call(FCITX_SERVICE,
+        input_context_path, INPUT_CONTEXT_INTERFACE, "ProcessKeyEvent");
+    if (!request) {
+        pthread_mutex_unlock(&input_mutex);
+        return -1;
+    }
+    const dbus_bool_t is_release = release ? TRUE : FALSE;
+    dbus_message_append_args(request,
+        DBUS_TYPE_UINT32, &keyval,
+        DBUS_TYPE_UINT32, &keycode,
+        DBUS_TYPE_UINT32, &state,
+        DBUS_TYPE_BOOLEAN, &is_release,
+        DBUS_TYPE_UINT32, &time,
+        DBUS_TYPE_INVALID);
+    DBusError error;
+    dbus_error_init(&error);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(
+        input_connection, request, 100, &error);
+    dbus_message_unref(request);
+    if (!reply) {
+        enqueue_message("ERROR:ProcessKeyEvent keyval=%u state=%u release=%d error=%s",
+            keyval, state, release,
+            dbus_error_is_set(&error) ? error.message : "no reply");
+        dbus_error_free(&error);
+        pthread_mutex_unlock(&input_mutex);
+        return -1;
+    }
+    dbus_bool_t accepted = FALSE;
+    const int valid_reply = dbus_message_get_args(reply, &error,
+        DBUS_TYPE_BOOLEAN, &accepted, DBUS_TYPE_INVALID);
+    dbus_message_unref(reply);
+    if (!valid_reply) {
+        enqueue_message("ERROR:ProcessKeyEvent invalid reply error=%s",
+            dbus_error_is_set(&error) ? error.message : "invalid reply");
+        dbus_error_free(&error);
+        pthread_mutex_unlock(&input_mutex);
+        return -1;
+    }
+    dbus_error_free(&error);
+    pthread_mutex_unlock(&input_mutex);
+    enqueue_message("LOG:InputKey keyval=%u keycode=%u state=%u release=%d accepted=%d",
+        keyval, keycode, state, release, accepted);
+    return accepted ? 1 : 0;
+}
+
+static void *monitor_worker(void *unused) {
+    (void)unused;
+    int monitor_active = 0;
+
+    DBusError error;
+    dbus_error_init(&error);
+    connection = dbus_bus_get_private(DBUS_BUS_SESSION, &error);
+    if (!connection) {
+        enqueue_message("ERROR:session bus error=%s",
+            dbus_error_is_set(&error) ? error.message : "unknown");
+        dbus_error_free(&error);
+        goto stopped;
+    }
+    dbus_connection_set_exit_on_disconnect(connection, FALSE);
+
+    if (discover_rimworld_destinations()) {
+        monitor_active = become_monitor();
+    } else {
+        enqueue_message("LOG:no existing game D-Bus client; using direct input context");
+    }
+    if (!monitor_active)
+        enqueue_message("LOG:passive D-Bus monitor unavailable; direct input remains enabled");
+    if (!create_input_context()) goto stopped;
+
+    enqueue_message("READY:%u", rimworld_pid);
+    while (atomic_load_explicit(&running, memory_order_relaxed) &&
+        !atomic_load_explicit(&restart_requested, memory_order_relaxed) &&
+        kill((pid_t)rimworld_pid, 0) == 0) {
+        if (monitor_active) {
+            if (!dbus_connection_read_write(connection, 10)) break;
+            DBusMessage *message;
+            while ((message = dbus_connection_pop_message(connection)) != NULL) {
+                handle_message(message, 0);
+                dbus_message_unref(message);
+            }
+        }
+        if (!pump_input_connection()) break;
+    }
+
+stopped:
+    close_input_connection();
+    close_connection();
+    atomic_store_explicit(&running, 0, memory_order_relaxed);
+    enqueue_message("STOPPED");
+    return NULL;
+}
+
+EXPORT void fcitx_bridge_set_debug(int enabled) {
+    const int changed = atomic_exchange_explicit(&debug_logging, enabled != 0,
+        memory_order_relaxed) != (enabled != 0);
+    if (changed && atomic_load_explicit(&running, memory_order_relaxed))
+        atomic_store_explicit(&restart_requested, 1, memory_order_relaxed);
+}
+
+EXPORT int fcitx_bridge_start(uint32_t pid) {
+    pthread_mutex_lock(&state_mutex);
+    if (!dbus_threads_ready) {
+        if (!dbus_threads_init_default()) {
+            pthread_mutex_unlock(&state_mutex);
+            return ENOMEM;
+        }
+        dbus_threads_ready = 1;
+    }
+    if (atomic_load_explicit(&running, memory_order_relaxed)) {
+        pthread_mutex_unlock(&state_mutex);
+        return 0;
+    }
+    if (worker_created) {
+        pthread_join(worker_thread, NULL);
+        worker_created = 0;
+    }
+
+    rimworld_pid = pid;
+    context_count = 0;
+    next_sequence = 0;
+    atomic_store_explicit(&restart_requested, 0, memory_order_relaxed);
+    memset(pending_keys, 0, sizeof(pending_keys));
+    next_pending_key = 0;
+    atomic_store_explicit(&running, 1, memory_order_relaxed);
+    const int result = pthread_create(&worker_thread, NULL, monitor_worker, NULL);
+    if (result == 0) worker_created = 1;
+    else {
+        atomic_store_explicit(&running, 0, memory_order_relaxed);
+        enqueue_message("ERROR:pthread_create result=%d", result);
+    }
+    pthread_mutex_unlock(&state_mutex);
+    return result;
+}
+
+EXPORT int fcitx_bridge_poll(char *buffer, int capacity) {
+    if (!buffer || capacity <= 1) return -1;
+
+    pthread_mutex_lock(&queue_mutex);
+    if (atomic_exchange_explicit(&queue_desynced, 0, memory_order_relaxed)) {
+        struct message_node *discarded = queue_head;
+        queue_head = NULL;
+        queue_tail = NULL;
+        queue_count = 0;
+        pthread_mutex_unlock(&queue_mutex);
+        while (discarded) {
+            struct message_node *next = discarded->next;
+            free(discarded->text);
+            free(discarded);
+            discarded = next;
+        }
+        const char reset[] = "EVENT:0:0:RESET:queue-drop";
+        const size_t reset_length = sizeof(reset) - 1;
+        const size_t copy_length = reset_length < (size_t)(capacity - 1)
+            ? reset_length : (size_t)(capacity - 1);
+        memcpy(buffer, reset, copy_length);
+        buffer[copy_length] = '\0';
+        return (int)copy_length;
+    }
+    struct message_node *node = queue_head;
+    if (!node) {
+        pthread_mutex_unlock(&queue_mutex);
+        return 0;
+    }
+    queue_head = node->next;
+    if (!queue_head) queue_tail = NULL;
+    queue_count--;
+    pthread_mutex_unlock(&queue_mutex);
+
+    const size_t length = strlen(node->text);
+    const size_t copy_length = length < (size_t)(capacity - 1)
+        ? length : (size_t)(capacity - 1);
+    memcpy(buffer, node->text, copy_length);
+    buffer[copy_length] = '\0';
+    free(node->text);
+    free(node);
+    return (int)copy_length;
+}
+
+EXPORT int fcitx_bridge_is_running(void) {
+    return atomic_load_explicit(&running, memory_order_relaxed);
+}
+
+EXPORT void fcitx_bridge_stop(void) {
+    pthread_mutex_lock(&state_mutex);
+    atomic_store_explicit(&running, 0, memory_order_relaxed);
+    if (worker_created) {
+        pthread_join(worker_thread, NULL);
+        worker_created = 0;
+    }
+    pthread_mutex_unlock(&state_mutex);
+}
+
+__attribute__((destructor))
+static void stop_bridge_on_unload(void) {
+    fcitx_bridge_stop();
+}
