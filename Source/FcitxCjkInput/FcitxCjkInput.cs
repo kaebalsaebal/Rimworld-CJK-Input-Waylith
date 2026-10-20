@@ -206,7 +206,7 @@ namespace FcitxCjkInput {
         }
 
         private static void Patch() {
-            var harmony = new Harmony("scarf.cjkinput");
+            var harmony = new Harmony("MaSangChang.cjkinputwaylith");
             var rootOnGui = AccessTools.Method(typeof(Root), "OnGUI");
             //var desktopTextField = AccessTools.Method(typeof(GUI), "HandleTextFieldEventForDesktop");
             var desktopTextField = AccessTools.Method(typeof(GUI), "DoTextField", new[] {
