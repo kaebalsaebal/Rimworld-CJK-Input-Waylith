@@ -6,8 +6,8 @@
     <ProjectGuid>{F1E2D3C4-B5A6-7890-CDEF-1234567890AB}</ProjectGuid>
     <OutputType>Library</OutputType>
     <AppDesignerFolder>Properties</AppDesignerFolder>
-    <RootNamespace>FcitxCjkInput</RootNamespace>
-    <AssemblyName>FcitxCjkInput</AssemblyName>
+    <RootNamespace>FcitxCjkInputWaylith</RootNamespace>
+    <AssemblyName>FcitxCjkInputWaylith</AssemblyName>
     <TargetFramework>net10.0</TargetFramework>
     <FileAlignment>512</FileAlignment>
     <IsPublishable>false</IsPublishable>
